@@ -258,6 +258,10 @@ Safest local verification sequence after non-trivial changes:
 - Whenever you must bring in new dependencies, check latest documentation for knowledge, and discuss with the user.
 - Always use test driven development for bug fixes and feature development.
 
+## Raising PRs to upstream
+
+Human-authored PRs targeting `main` must go through the no-mistakes pipeline: create a branch, run `no-mistakes init --fork-url git@github.com:onyx-space/no-mistakes.git`, then push via `git push no-mistakes` instead of `origin` — the pipeline reviews/tests/lints in an isolated worktree, forwards the push only after checks pass, and opens the PR with the body signature CI requires. See CONTRIBUTING.md "Workflow".
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
