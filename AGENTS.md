@@ -260,7 +260,7 @@ Safest local verification sequence after non-trivial changes:
 
 ## Raising PRs to upstream
 
-Human-authored PRs targeting `main` must go through the no-mistakes pipeline: create a branch, run `no-mistakes init --fork-url git@github.com:onyx-space/no-mistakes.git`, then push via `git push no-mistakes` instead of `origin` — the pipeline reviews/tests/lints in an isolated worktree, forwards the push only after checks pass, and opens the PR with the body signature CI requires. See CONTRIBUTING.md "Workflow".
+Human-authored PRs targeting `main` must go through the no-mistakes pipeline: create a branch, run `no-mistakes init --fork-url git@github.com:<you>/no-mistakes.git`, then push via `git push no-mistakes` instead of `origin` — the pipeline reviews/tests/lints in an isolated worktree, forwards the push only after checks pass, and opens the PR with the body signature CI requires. See CONTRIBUTING.md "Workflow".
 
 ## Maintaining this file
 
