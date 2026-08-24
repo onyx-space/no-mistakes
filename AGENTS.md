@@ -258,7 +258,9 @@ Safest local verification sequence after non-trivial changes:
 - Whenever you must bring in new dependencies, check latest documentation for knowledge, and discuss with the user.
 - Always use test driven development for bug fixes and feature development.
 
-## Raising PRs to upstream
+## Raising PRs
+
+PRs in this repo are routed through `pr-axi`: `pr-axi raise` opens a same-repo PR (onyx-space/no-mistakes), `pr-axi raise --upstream` opens a PR to the parent (kunchenguid/no-mistakes) via a transient fork switch. See `~/.agents/skills/pr-axi/SKILL.md`.
 
 Human-authored PRs targeting `main` must go through the no-mistakes pipeline: create a branch, run `no-mistakes init --fork-url git@github.com:<you>/no-mistakes.git`, then push via `git push no-mistakes` instead of `origin` — the pipeline reviews/tests/lints in an isolated worktree, forwards the push only after checks pass, and opens the PR with the body signature CI requires. See CONTRIBUTING.md "Workflow".
 
