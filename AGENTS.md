@@ -134,6 +134,12 @@ The rationale lives in the `resolveRun` doc comment and the status-rendering com
 - Detailed performance evidence is LOCAL-ONLY (`agent_invocations` rows plus `runs.parked_ms`); never store prompts, outputs, diffs, or raw command arguments there (shape-guard test `TestAgentInvocations_PrivacySafeShape`) and never send run IDs, paths, session identities, or per-invocation records to Umami - the only remote perf data is three bounded counts on the terminal `run finished` event. The local/remote split is documented in `docs/src/content/docs/reference/environment.md`; read locally with `no-mistakes stats`.
 - Session-fidelity metric counts and timing boundaries have ONE authoritative home, `internal/agent/invocationmetrics.go` (tool-category classifier, `InvocationMetrics`, `FreshInputTokens`, `PerRoundTokens`, `ModelTimeMS`); the codex adapter fills them from its live `exec --json` event stream (`codex_metrics.go`) and the additive fidelity fields plus cache-creation usage are nullable so a not-reported datum is stored as NULL, never a fabricated zero. Codex's live stream exposes neither the model (resolved best-effort from the `~/.codex/sessions` rollout) nor internal model-request counts (it batches one exec into a single `turn.completed`, so round-trips are counted from completed items and subprocess wait is the reader-timed tool-item interval); codex usage is cumulative across a resumed session, so per-round deltas subtract the same session's prior cumulative (`Result.SessionUsageCumulative`). Regressions: `internal/agent/invocationmetrics_test.go`, `internal/agent/codex_metrics_test.go`, `internal/pipeline/instrument_fidelity_test.go`, `internal/db/agent_invocation_test.go` (`TestOpenMigratesSessionFidelityColumns`).
 
+## Raising PRs
+
+PRs in this repo are routed through `pr-axi`: `pr-axi raise` opens a same-repo PR (onyx-space/no-mistakes), `pr-axi raise --upstream` opens a PR to the parent (kunchenguid/no-mistakes) via a transient fork switch. See `~/.agents/skills/pr-axi/SKILL.md`.
+
+Human-authored PRs targeting `main` must go through the no-mistakes pipeline: create a branch, run `no-mistakes init --fork-url git@github.com:<you>/no-mistakes.git`, then push via `git push no-mistakes` instead of `origin` — the pipeline reviews/tests/lints in an isolated worktree, forwards the push only after checks pass, and opens the PR with the body signature CI requires. See CONTRIBUTING.md "Workflow".
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
