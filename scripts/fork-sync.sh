@@ -215,8 +215,8 @@ if not os.path.exists(path):
     raise SystemExit(0)
 con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 for run_id, branch, status in con.execute(
-    "select id, branch, status from runs where status not in "
-    "('completed','failed','cancelled','aborted') order by created_at desc"
+    "select id, branch, status from runs where status in "
+    "('pending','running') order by created_at desc"
 ):
     print(f"  {run_id}  {status}  {branch}")
 PY
@@ -239,23 +239,58 @@ if [ ! -f "$BACKUP" ]; then
 	log "backed up $old_version to $BACKUP"
 fi
 
+daemon_restart() {
+	if [ "$FORCE" = 1 ]; then
+		"$BIN" daemon restart --force
+	else
+		"$BIN" daemon restart
+	fi
+}
+
+# The daemon must have started after the binary it now runs. daemon.pid records
+# the daemon's own start time, so this compares it against the installed
+# binary's mtime: portable, with no /proc dependency.
+# Exit codes: 0 fresh, 1 stale, 2 unverifiable.
+daemon_fresh() {
+	local pidfile="$1" bin="$2"
+	command -v python3 >/dev/null 2>&1 || return 2
+	python3 - "$pidfile" "$bin" <<'PY'
+import json, os, sys
+from datetime import datetime
+pid_path, bin_path = sys.argv[1], sys.argv[2]
+try:
+    with open(pid_path) as fh:
+        started = json.load(fh).get("started_at")
+    if not started:
+        raise ValueError("no started_at")
+    started_at = datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
+    installed_at = os.stat(bin_path).st_mtime
+except (OSError, ValueError):
+    raise SystemExit(2)
+raise SystemExit(0 if started_at >= installed_at else 1)
+PY
+}
+
 installed=0
 settled=0
+restart_attempted=0
 on_exit() {
 	status=$?
 	if [ "$installed" = 1 ] && [ "$settled" = 0 ]; then
 		log "rolling back to $old_version"
 		install -m 755 "$BACKUP" "$BIN" || log "rollback failed; restore $BACKUP by hand"
-		"$BIN" daemon restart >/dev/null 2>&1 ||
-			log "the daemon still runs the new build; restart it once it is idle"
+		if [ "$restart_attempted" = 1 ]; then
+			daemon_restart >/dev/null 2>&1 ||
+				log "the daemon still runs the new build; restart it once it is idle"
+		fi
 	fi
 	cleanup
 	exit "$status"
 }
 trap on_exit EXIT
 
-install -m 755 "$BUILT" "$BIN"
 installed=1
+install -m 755 "$BUILT" "$BIN"
 
 cmp -s "$BUILT" "$BIN" || die "the installed binary does not match the built one"
 
@@ -266,12 +301,16 @@ cmp -s "$BUILT" "$BIN" || die "the installed binary does not match the built one
 if [ "$(git -C "$WORKDIR" rev-parse HEAD)" = "$before_head" ] && cmp -s "$BUILT" "$BACKUP" 2>/dev/null; then
 	log "the installed binary already is this build; leaving the daemon alone"
 else
-	"$BIN" daemon restart || die "daemon restart failed (the previous binary is restored)"
+	restart_attempted=1
+	daemon_restart || die "daemon restart failed (the previous binary is restored)"
 
-	pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "${NM_HOME:-$HOME/.no-mistakes}/daemon.pid" 2>/dev/null || true)"
-	[ -n "$pid" ] || die "cannot read the daemon pid (the previous binary is restored)"
-	[ -n "$(find "/proc/$pid" -maxdepth 0 -newer "$BIN" 2>/dev/null)" ] ||
+	fresh_rc=0
+	daemon_fresh "${NM_HOME:-$HOME/.no-mistakes}/daemon.pid" "$BIN" || fresh_rc=$?
+	if [ "$fresh_rc" = 1 ]; then
 		die "the running daemon predates the installed binary (the previous binary is restored)"
+	elif [ "$fresh_rc" = 2 ]; then
+		log "note: could not verify the running daemon is this build; continuing"
+	fi
 fi
 
 settled=1
