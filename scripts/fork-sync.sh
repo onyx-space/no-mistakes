@@ -149,7 +149,9 @@ git -C "$REPO" fetch --prune upstream
 if preflight="$(git -C "$WORKDIR" merge-tree --write-tree HEAD upstream/main 2>&1)"; then
 	:
 elif printf '%s\n' "$preflight" | grep -q '^CONFLICT'; then
-	printf '%s\n' "$preflight" >&2
+	# merge-tree also prints the conflicted blob modes and object ids; the
+	# operator needs the file list, not the object table.
+	printf '%s\n' "$preflight" | grep -E '^(CONFLICT|Auto-merging)' >&2
 	die "merging upstream/main into $BRANCH conflicts (see above); resolve it by hand"
 else
 	log "note: merge preflight unavailable, continuing"
@@ -199,6 +201,18 @@ if [ "$NO_INSTALL" = 1 ]; then
 	exit 0
 fi
 
+# `make build` stamps the build date, so two builds of the same commit are not
+# byte-identical. The version stamp is what identifies the build: it carries the
+# commit, the tag distance, and whether the tree was dirty. Reinstalling and
+# bouncing the daemon for an identical version would be work with no effect, and
+# a second run must not disturb a daemon that is already serving this build.
+old_version="$("$BIN" --version | awk '{print $3}')"
+if [ "$old_version" = "$built_version" ]; then
+	log "$BIN already is this build ($built_version); leaving it and the daemon alone"
+	log "done"
+	exit 0
+fi
+
 # ---------------------------------------------------------------------------
 # 5. Replace the runtime, keeping the previous binary for rollback.
 # ---------------------------------------------------------------------------
@@ -231,7 +245,6 @@ elif [ -n "$runs" ]; then
 	log "note: could not read the pipeline run registry; the daemon restart below still refuses a busy daemon"
 fi
 
-old_version="$("$BIN" --version | awk '{print $3}')"
 BACKUP="$BACKUP_DIR/no-mistakes.bak-$old_version"
 mkdir -p "$BACKUP_DIR"
 if [ ! -f "$BACKUP" ]; then
@@ -311,20 +324,16 @@ cmp -s "$BUILT" "$BIN" || die "the installed binary does not match the built one
 # 6. Point the daemon at the new build and verify the running process is it.
 # ---------------------------------------------------------------------------
 
-if [ "$(git -C "$WORKDIR" rev-parse HEAD)" = "$before_head" ] && cmp -s "$BUILT" "$BACKUP" 2>/dev/null; then
-	log "the installed binary already is this build; leaving the daemon alone"
-else
-	restart_attempted=1
-	daemon_restart || die "daemon restart failed (the previous binary is restored)"
-	restart_succeeded=1
+restart_attempted=1
+daemon_restart || die "daemon restart failed (the previous binary is restored)"
+restart_succeeded=1
 
-	fresh_rc=0
-	daemon_fresh "${NM_HOME:-$HOME/.no-mistakes}/daemon.pid" "$BIN" || fresh_rc=$?
-	if [ "$fresh_rc" = 1 ]; then
-		die "the running daemon predates the installed binary (the previous binary is restored)"
-	elif [ "$fresh_rc" = 2 ]; then
-		log "note: could not verify the running daemon is this build; continuing"
-	fi
+fresh_rc=0
+daemon_fresh "${NM_HOME:-$HOME/.no-mistakes}/daemon.pid" "$BIN" || fresh_rc=$?
+if [ "$fresh_rc" = 1 ]; then
+	die "the running daemon predates the installed binary (the previous binary is restored)"
+elif [ "$fresh_rc" = 2 ]; then
+	log "note: could not verify the running daemon is this build; continuing"
 fi
 
 settled=1

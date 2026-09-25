@@ -78,8 +78,9 @@ install -m644 ~/code/no-mistakes/scripts/fork-sync.md \
    `no-mistakes daemon restart` → 校验运行中的 daemon 进程晚于新二进制。
 8. 任何失败：回滚到备份（并尝试把 daemon 指回旧构建），退出非零。
 
-幂等：对已同步的 fork 再跑一次，merge 无事可做、build 出同样字节、install 同样字节、
-且**不重启 daemon**。
+幂等：对已同步的 fork 再跑一次，merge 无事可做、build 出**同版本戳**的产物（`make build` 会把
+构建时间嵌进去，所以字节不同、版本相同），install 与 daemon 重启都跳过。判据是
+`no-mistakes --version` 的版本戳（= 该分支的 `git describe`），不是字节。
 
 ## 常见坑
 
