@@ -248,27 +248,34 @@ daemon_restart() {
 }
 
 # The daemon must have started after the binary it now runs. daemon.pid records
-# the daemon's own start time, so this compares it against the installed
-# binary's mtime: portable, with no /proc dependency.
+# the daemon's own start time at whole-second resolution (ps -o lstart=), so
+# both sides are compared floored to the second: a start in the same second as
+# the install is not read as stale.
 # Exit codes: 0 fresh, 1 stale, 2 unverifiable.
 daemon_fresh() {
-	local pidfile="$1" bin="$2"
+	local pidfile="$1" bin="$2" verdict
 	command -v python3 >/dev/null 2>&1 || return 2
-	python3 - "$pidfile" "$bin" <<'PY'
-import json, os, sys
+	verdict="$(python3 - "$pidfile" "$bin" <<'PY'
+import json, math, os, sys
 from datetime import datetime
-pid_path, bin_path = sys.argv[1], sys.argv[2]
 try:
-    with open(pid_path) as fh:
+    with open(sys.argv[1]) as fh:
         started = json.load(fh).get("started_at")
     if not started:
         raise ValueError("no started_at")
     started_at = datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
-    installed_at = os.stat(bin_path).st_mtime
-except (OSError, ValueError):
-    raise SystemExit(2)
-raise SystemExit(0 if started_at >= installed_at else 1)
+    installed_at = os.stat(sys.argv[2]).st_mtime
+except Exception:
+    print("unknown")
+else:
+    print("fresh" if math.floor(started_at) >= math.floor(installed_at) else "stale")
 PY
+)" || return 2
+	case "$verdict" in
+	fresh) return 0 ;;
+	stale) return 1 ;;
+	*) return 2 ;;
+	esac
 }
 
 installed=0
