@@ -2334,9 +2334,11 @@ func validatePathInstructionGlob(pattern string) error {
 // self-declare no-CI and bypass its own checks, and CI (the transient-rerun
 // budget) is trusted-only because every rerun it authorizes is another
 // provider-side workflow run billed to the repository. These gate-control
-// fields ignore allowRepoCommands. PR is the explicit exception: the
-// allowRepoCommands opt-in also permits a pushed PR target because it controls
-// where a maintainer-authorized PR lands, not code execution.
+// fields ignore allowRepoCommands. pr.base_branch is the explicit exception:
+// the allowRepoCommands opt-in also permits a pushed PR target because it
+// controls where a maintainer-authorized PR lands, not code execution.
+// pr.instructions is trusted-only like the fields above, since it steers the
+// agent that drafts the body reviewing the pushed branch.
 // When allowRepoCommands is
 // true the maintainer has explicitly opted in (via allow_repo_commands on the
 // TRUSTED default-branch copy) to honoring the pushed branch's commands and

@@ -26,8 +26,9 @@ install -m644 ~/code/no-mistakes/scripts/fork-sync.md \
 - **运行时 = 本地构建**：端点的 `no-mistakes` 命令指向本机 fork 检出的 `make build`
   产物，经 `install -m 755` 装到 `~/.local/bin/no-mistakes`。所以「升级」=
   同步 fork + 重新 build + 换二进制，**不是** `no-mistakes update`。
-- **`no-mistakes update` 会换掉它**：它从 GitHub 下载官方 release（当前会从
-  `v1.72.0-12-g38bd649` 换到官方 `v1.79.0+`），也就是 fork 的本地血统被官方版顶掉。
+- **`no-mistakes update` 会换掉它**：它从 GitHub 下载官方最新 release，把本机这份
+  fork 构建（`no-mistakes --version` 打印的 `git describe --tags --always` 血统
+  `v<tag>-<n>-g<sha>`，无 tag 时就是短 sha）换成官方版，fork 的本地血统被顶掉。
   该命令不得用于更新运行时；跑过之后要用 `readlink -f "$(command -v no-mistakes)"`
   与 `no-mistakes --version` 复核。
 - **先验证再换二进制**：脚本先 `make build`，再比对构建产物自报的版本与
@@ -36,8 +37,9 @@ install -m644 ~/code/no-mistakes/scripts/fork-sync.md \
   回滚（**失败时留在盘上的仍是原来那个二进制**）。
 - **不打断在飞管线**：daemon 与 CLI 不能跑不同构建（生命周期闸就是为此存在的）。
   脚本在替换二进制**之前**读 `~/.no-mistakes/state.sqlite` 的 `runs` 表，有未终态 run
-  就拒绝并列出，除非显式 `--force`。替换成功后用 `no-mistakes daemon restart` 让 daemon
-  吃上新构建；daemon 判据 = 进程启动时间晚于二进制 mtime。
+  就拒绝并列出，除非显式 `--force`（`--force` 同时透传给 `daemon restart`）。替换成功后用
+  `no-mistakes daemon restart` 让 daemon 吃上新构建；daemon 判据 = `daemon.pid` 记录的
+  进程启动时间（秒级）不早于二进制 mtime，读不到就告警继续。
 
 ## 用法
 
@@ -89,5 +91,5 @@ install -m644 ~/code/no-mistakes/scripts/fork-sync.md \
   `--version` 与 `readlink -f` 复核，并按上面的流程重新 build 装回。
 - **有在飞 run 时替换二进制**：不要 `--force`；先等管线落定（`no-mistakes axi status`）。
 - **daemon 起不来**：脚本会回滚二进制；回滚后再看 `~/.no-mistakes/logs/daemon-bootstrap.log`。
-- **`make build` 报找不到 go**：脚本会把 `/usr/local/go/bin` 与 `~/go/bin` 补进 PATH，
-  仍失败就是 Go 本体缺失。
+- **`make build` 报找不到 go**：脚本会把 `/usr/local/go/bin`、`~/go/bin` 与
+  `/opt/homebrew/bin`（macOS）补进 PATH，仍失败就是 Go 本体缺失。
