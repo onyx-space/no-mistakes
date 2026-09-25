@@ -311,6 +311,24 @@ func redactPRContent(content prContent) prContent {
 	return content
 }
 
+// trustedPRInstructionsSection renders the repository's pull-request content
+// policy: the language, section order, and folding the drafted title and body
+// must follow. The value comes from the trusted default-branch copy of
+// .no-mistakes.yaml (config.EffectiveRepoConfig), so a contributor's pushed
+// branch cannot steer the shape of the body that reviews it. An empty value
+// returns an empty string, which leaves the prompt byte-for-byte unchanged.
+func trustedPRInstructionsSection(sctx *pipeline.StepContext) string {
+	if sctx.Config == nil {
+		return ""
+	}
+	instructions := strings.TrimSpace(sctx.Config.PR.Instructions)
+	if instructions == "" {
+		return ""
+	}
+	return "\nRepository pull request content policy (trusted, from the default branch; augments the rules above):\n" +
+		sanitizePromptMultilineText(instructions) + "\n"
+}
+
 func (s *PRStep) draftPRContent(sctx *pipeline.StepContext, branch, baseBranch, baseSHA string, provider scm.Provider, bodyLimit int) (prContent, error) {
 	ctx := sctx.Ctx
 	diffStat, _ := git.Run(ctx, sctx.WorkDir, "diff", "--stat", baseSHA+".."+sctx.Run.HeadSHA)
@@ -337,12 +355,12 @@ Rules:
 - Body: a "## What Changed" section in GitHub-flavored markdown. 1-3 concise bullet points describing the concrete changes in this branch (what code/behavior shifted), not the user's motivation. Do not include Intent, Risk Assessment, Testing, or Pipeline sections - those are prepended/appended separately. The body value must be plain markdown text, never a JSON object or serialized JSON string.
 - Derive every body claim from the final diff. Inspect it directly when the paths and statuses below do not provide enough detail.
 - Do not invent tests or behavior.
-
+%s
 Diff stat:
 %s
 
 Final diff paths and statuses:
-%s%s%s`, branch, baseSHA, sctx.Run.HeadSHA, baseBranch, conventional.ReleaseTypeRule, diffStat, finalDiff, userIntentPromptSection(sctx), executionContextPromptSection(sctx.WorkDir))
+%s%s%s`, branch, baseSHA, sctx.Run.HeadSHA, baseBranch, conventional.ReleaseTypeRule, trustedPRInstructionsSection(sctx), diffStat, finalDiff, userIntentPromptSection(sctx), executionContextPromptSection(sctx.WorkDir))
 
 	prompt += prBodyBudgetPromptSection(bodyLimit)
 

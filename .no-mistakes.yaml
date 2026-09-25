@@ -17,6 +17,34 @@ commands:
 auto_fix:
   review: 0
 
+# Pull-request content policy for the draft the PR step writes. Honored only
+# from this default-branch copy, and only for the drafted title and
+# `## What Changed` body: the tool composes `## Intent` ahead of it and
+# `## Risk Assessment`, `## Testing`, and `## Pipeline` after it.
+pr:
+  instructions: |
+    Title: keep the conventional-commit prefix in English (`type(scope): ` or
+    `type: `), then write the description after it in Chinese.
+    Body: write the `## What Changed` prose in Chinese first. That is the part a
+    reader of this repository sees without expanding anything, so it must carry
+    the complete summary on its own.
+    After the Chinese prose, open the English fold and leave it open - the
+    tool's own English sections (Risk Assessment, Testing, Pipeline) are
+    appended after this body and must land inside the fold:
+
+    <details>
+    <summary>English</summary>
+
+    ## What Changed
+
+    <the same content in English, complete and not abridged>
+
+    Do not close the `</details>` block; the appended sections fall inside it.
+    Keep code, commands, paths, file and function names, repository and branch
+    names, and identifiers verbatim in both languages.
+    Do not add Intent, Risk Assessment, Testing, or Pipeline sections yourself -
+    the tool owns those, and the intent text it prints is the caller's own.
+
 # Documentation ownership map for the document step's placement policy.
 document:
   instructions: |

@@ -251,9 +251,10 @@ type RepoConfig struct {
 	// the pushed SHA), so a contributor cannot self-enable. Default false:
 	// the pushed branch controls nothing that executes.
 	AllowRepoCommands bool `yaml:"allow_repo_commands"`
-	// PR carries pull-request routing settings. BaseBranch controls where a PR
-	// lands, so EffectiveRepoConfig treats it as trusted-only unless the
-	// repository explicitly opts into pushed settings.
+	// PR carries pull-request settings. BaseBranch controls where a PR lands,
+	// so EffectiveRepoConfig treats it as trusted-only unless the repository
+	// explicitly opts into pushed settings; instructions steers the body that
+	// reviews the pushed branch, so it is trusted-only unconditionally.
 	AutoFix AutoFixRaw `yaml:"auto_fix"`
 	CI      CIRaw      `yaml:"ci"`
 	Commit  CommitRaw  `yaml:"commit"`
@@ -326,6 +327,14 @@ type PRRaw struct {
 	// repository explicitly opts into pushed-branch settings with
 	// allow_repo_commands.
 	BaseBranch string `yaml:"base_branch"`
+	// Instructions is the repository's pull-request content policy: the title
+	// and body shape (language, section order, folding) the drafter must
+	// follow. It is injected into the PR step's drafting prompt, so like
+	// document.instructions and test.instructions it is honored ONLY from the
+	// trusted default-branch copy of .no-mistakes.yaml (see
+	// EffectiveRepoConfig): a contributor's pushed branch must not be able to
+	// steer the language of the body that reviews it.
+	Instructions string `yaml:"instructions"`
 }
 
 // PathInstruction is one glob-scoped block of review guidance. Path follows the
@@ -677,9 +686,12 @@ type AzureDevOpsProvider struct {
 	DraftPullRequests bool
 }
 
-// PR is the resolved pull-request configuration.
+// PR is the resolved pull-request configuration. Instructions come from the
+// trusted default-branch repo config and augment the drafting rules in the PR
+// step's prompt.
 type PR struct {
-	BaseBranch string
+	BaseBranch   string
+	Instructions string
 }
 
 // Document is the resolved document-step config. Instructions come from the
@@ -2391,6 +2403,13 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		// must not be able to rewrite or weaken the guidance that steers the
 		// gate validating their own branch.
 		effective.Test.Instructions = trusted.Test.Instructions
+		// pr.instructions steers the drafting agent that writes the body
+		// reviewing the pushed branch, so it is trusted-only for exactly the
+		// reasons document.instructions and test.instructions are. It is copied
+		// here rather than left to the allow_repo_commands-gated
+		// `effective.PR = trusted.PR` below, so enabling that opt-in keeps the
+		// maintainer's content policy instead of dropping it.
+		effective.PR.Instructions = trusted.PR.Instructions
 		// pr.base_branch controls where the contributor's PR lands, so it is
 		// trusted-only unless the repository explicitly opts into pushed
 		// settings alongside commands and agent selection.
@@ -2406,6 +2425,10 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		effective.CI = CIRaw{}
 		effective.Test.Evidence.Branch = nil
 		effective.Test.Instructions = ""
+		// Without a trusted copy the pushed content policy is dropped rather
+		// than falling back to the branch, the same rule the runbook above
+		// follows.
+		effective.PR.Instructions = ""
 		if !allowRepoCommands {
 			effective.PR = PRRaw{}
 		}
@@ -2814,7 +2837,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		Test:           test,
 		Document:       Document{Instructions: strings.TrimSpace(repo.Document.Instructions)},
 		Review:         Review{PathInstructions: resolvePathInstructions(repo.Review.PathInstructions)},
-		PR:             PR{BaseBranch: strings.TrimSpace(repo.PR.BaseBranch)},
+		PR:             PR{BaseBranch: strings.TrimSpace(repo.PR.BaseBranch), Instructions: strings.TrimSpace(repo.PR.Instructions)},
 		ForgeProfiles:  global.ForgeProfiles,
 		Providers:      providers,
 		// repo is the EffectiveRepoConfig result, so this value is already

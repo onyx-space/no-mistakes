@@ -8,12 +8,12 @@ Per-repo configuration lives in `.no-mistakes.yaml` at the root of your reposito
 :::caution[Security: gate-control fields are read from the default branch]
 `commands.*` execute arbitrary shell on the daemon host via `sh -c` / `cmd.exe /c`, and `agent` selects which process launches there (including ordered fallback lists, ACP aliases such as `cursor`, and `acp:` targets) with the maintainer's credentials.
 To prevent a supply-chain attack where a contributor lands a hostile value on a gated branch, the daemon always reads **`commands` and `agent` from your default branch** (e.g. `origin/main`), never from the pushed SHA, and reads them at the exact commit a fresh fetch resolved (so a stale `origin/<default>` ref cannot serve a value the live default branch removed).
-The daemon also reads `document.instructions`, `review.path_instructions`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.revalidate_repairs`, `test.instructions`, and `test.evidence.branch` only from that trusted copy.
+The daemon also reads `document.instructions`, `review.path_instructions`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.revalidate_repairs`, `test.instructions`, `test.evidence.branch`, and `pr.instructions` only from that trusted copy.
 `pr.base_branch` is trusted-default-branch-only as well, but unlike those fields it follows the same `allow_repo_commands: true` opt-in exception as `commands`/`agent` (see [`pr.base_branch`](#prbase_branch) below).
 If the default branch cannot be fetched and resolved to a readable commit, or its present `.no-mistakes.yaml` cannot be read and parsed, the run aborts before launching an agent.
 A readable default-branch tree with no `.no-mistakes.yaml` is valid and uses defaults.
 Commit the gate-control settings you want to your default branch.
-Non-executing fields (`ignore_patterns`, `auto_fix`, `commit`, `intent`, `test`, and `providers`) are still read from the pushed branch, except `test.instructions` and `test.evidence.branch`.
+Non-executing fields (`ignore_patterns`, `auto_fix`, `commit`, `intent`, `test`, and `providers`) are still read from the pushed branch, except `test.instructions`, `test.evidence.branch`, and `pr.instructions`.
 
 If you genuinely want per-branch `commands` and `agent` (for example, a single-developer repo where you trust your own feature branches), opt in with [`allow_repo_commands: true`](#allow_repo_commands) in this same file on your default branch. This re-enables the previous behavior with eyes open. The switch is read only from the trusted default-branch copy, so a contributor cannot self-enable it from a pushed branch.
 :::
@@ -58,10 +58,15 @@ disable_project_settings: true
 # Read only from the trusted default branch. Defaults to false (CI expected).
 # no_ci: true
 
-# Optional PR target branch, read from the trusted default branch.
-# When unset, PRs target the repository's forge default branch.
+# Optional PR settings, read from the trusted default branch.
+# base_branch: when unset, PRs target the repository's forge default branch.
+# instructions: the title and body shape the PR drafter must follow.
 pr:
   base_branch: develop
+  instructions: |
+    Title: conventional type and scope, then the user-visible effect.
+    Body: the language readers of this repository use, with any generated
+    or translated section folded below the summary.
 
 auto_fix:
   rebase: 3
@@ -149,7 +154,7 @@ Opt in to honoring the code-executing selection fields (`commands.{prepare,test,
 | Type | `bool` |
 | Default | `false` |
 
-This field is itself read **only from the trusted default-branch copy** of `.no-mistakes.yaml`, never from the pushed SHA, so a contributor cannot self-enable it by setting it on a feature branch. By default the daemon reads `commands` and `agent` from your default branch (e.g. `origin/main`) so a pushed SHA cannot inject shell or pick the launched agent on the daemon host. This opt-in covers those two fields only; `document.instructions`, `review.path_instructions`, `test.instructions`, and `disable_project_settings` stay trusted-only either way. Leave this `false` for any repo that accepts contributions. Set it to `true` only for a single-developer environment where you trust every branch you push (for example, a personal repo gated by your own daemon).
+This field is itself read **only from the trusted default-branch copy** of `.no-mistakes.yaml`, never from the pushed SHA, so a contributor cannot self-enable it by setting it on a feature branch. By default the daemon reads `commands` and `agent` from your default branch (e.g. `origin/main`) so a pushed SHA cannot inject shell or pick the launched agent on the daemon host. This opt-in covers those two fields only; `document.instructions`, `review.path_instructions`, `test.instructions`, `pr.instructions`, and `disable_project_settings` stay trusted-only either way. Leave this `false` for any repo that accepts contributions. Set it to `true` only for a single-developer environment where you trust every branch you push (for example, a personal repo gated by your own daemon).
 
 ### disable_project_settings
 
@@ -214,6 +219,24 @@ Because this setting controls where a PR lands, a pushed branch cannot redirect 
 It is read from the trusted default-branch copy regardless of `allow_repo_commands` by default.
 The established explicit `allow_repo_commands: true` opt-in also applies to this setting for repositories that intentionally trust their pushed configuration, including a repository with no trusted default-branch copy of this file at all.
 An empty value is valid and means "fall back to the forge default branch"; a non-empty value that Git would reject as a branch name fails config parsing closed, naming `pr.base_branch` in the error.
+
+### pr.instructions
+
+State the title and body shape the PR step's drafting prompt must follow.
+
+| | |
+| --- | --- |
+| Type | `string` (multiline) |
+| Default | (empty - the built-in drafting rules alone) |
+| Trust | Trusted default branch only, regardless of `allow_repo_commands` |
+
+The PR step's body is composed by the tool, not by the caller: `draftPRContent` asks an agent for the title and the `## What Changed` section, then the step prepends `## Intent` (the run's own `--intent` text, verbatim) and appends the Risk Assessment, Testing, and Pipeline sections.
+This field is the repository's own rules for that drafted part - the title's language and shape, the language and reading order of the summary, and where a translated or generated section belongs - and it augments, never replaces, the built-in drafting rules.
+
+`pr.instructions` is injected into the drafting prompt of the agent that writes the body reviewing the pushed branch, so like [`document.instructions`](#documentinstructions) and [`test.instructions`](#testinstructions) it is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`, regardless of `allow_repo_commands`: a value present only on a pushed branch is ignored, so a contributor cannot write the language of their own pull request's visible content.
+
+An empty value leaves the drafting prompt exactly as it is without the field, byte for byte.
+The setting cannot reshape the sections the tool composes itself (Intent, Risk Assessment, Testing, Pipeline, and the attestation) - only the drafted title and `## What Changed` body.
 
 ### commands.prepare
 

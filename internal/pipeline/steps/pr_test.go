@@ -2273,6 +2273,57 @@ func TestPRStep_PromptRequiresReleaseTypesForProductImpact(t *testing.T) {
 	}
 }
 
+// TestPRStep_TrustedInstructionsAugmentDraftPrompt proves a repository's own
+// pull-request content policy (config pr.instructions, loaded only from the
+// trusted default branch) reaches the drafting prompt as an augmentation of
+// the built-in rules, and that a repository without the setting keeps the
+// draft prompt exactly as it was. The trust boundary itself - a pushed-branch
+// copy never reaching this prompt - is covered by
+// TestEffectiveRepoConfig_PRInstructionsTrustedOnly.
+func TestPRStep_TrustedInstructionsAugmentDraftPrompt(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			payload := json.RawMessage(`{"title":"feat(pr): shape the body","body":"## What Changed\n\n- shape it"}`)
+			return &agent.Result{Output: payload}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+
+	step := &PRStep{}
+	if _, err := step.buildPRContent(sctx, "feature", "main", baseSHA, scm.ProviderGitHub, 0); err != nil {
+		t.Fatal(err)
+	}
+	withoutPolicy := ag.calls[0].Prompt
+	if strings.Contains(withoutPolicy, "Repository pull request content policy") {
+		t.Fatalf("prompt gained a content policy section with pr.instructions unset:\n%s", withoutPolicy)
+	}
+	// The instruction slot must not disturb the prompt around it: with no
+	// policy set the rules list still runs straight into the diff sections.
+	if !strings.Contains(withoutPolicy, "- Do not invent tests or behavior.\n\nDiff stat:") {
+		t.Fatalf("an unset pr.instructions changed the draft prompt:\n%s", withoutPolicy)
+	}
+
+	sctx.Config.PR.Instructions = "Title: English type/scope, then a Chinese clause. Body: Chinese first, English folded below."
+	if _, err := step.buildPRContent(sctx, "feature", "main", baseSHA, scm.ProviderGitHub, 0); err != nil {
+		t.Fatal(err)
+	}
+	prompt := ag.calls[1].Prompt
+	if !strings.Contains(prompt, "Title: English type/scope, then a Chinese clause. Body: Chinese first, English folded below.") {
+		t.Fatalf("expected trusted repo content policy in the draft prompt:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "augments the rules above") {
+		t.Fatal("expected the repo policy to be framed as augmenting, not replacing, the drafting rules")
+	}
+	// The built-in drafting rules remain active alongside the custom policy.
+	if !strings.Contains(prompt, "- Cover the full branch delta, not just the latest commit.") {
+		t.Fatal("expected built-in drafting rules to remain with custom instructions present")
+	}
+}
+
 // TestPRStep_PromptGuidesScopeToRealModule verifies the PR prompt instructs
 // the agent to pick a scope that is a real, primary, not-too-granular
 // module/package name in the codebase.
