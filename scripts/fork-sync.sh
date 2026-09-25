@@ -211,14 +211,20 @@ daemon_restart() {
 	fi
 }
 
-# The daemon must have started after the binary it now runs. daemon.pid records
+# Liveness comes from the binary's own health check, not from the pidfile: a
+# SIGKILLed daemon leaves behind a pidfile whose timestamp still looks fresh. The
+# daemon must also have started after the binary it now runs. daemon.pid records
 # the daemon's own start time at whole-second resolution (ps -o lstart=), so
 # both sides are compared floored to the second: a start in the same second as
 # the install is not read as stale.
 # Exit codes: 0 fresh, 1 stale, 2 unverifiable, 3 no daemon running.
 daemon_fresh() {
-	local pidfile="$1" bin="$2" verdict
-	[ -e "$pidfile" ] || return 3
+	local pidfile="$1" bin="$2" verdict status_out
+	status_out="$(NO_MISTAKES_NO_UPDATE_CHECK=1 "$bin" daemon status 2>&1)" || return 3
+	case "$status_out" in
+	*"daemon running"*) ;;
+	*) return 3 ;;
+	esac
 	command -v python3 >/dev/null 2>&1 || return 2
 	verdict="$(python3 - "$pidfile" "$bin" <<'PY'
 import json, math, os, sys
@@ -226,13 +232,6 @@ from datetime import datetime
 try:
     with open(sys.argv[1]) as fh:
         started = json.load(fh).get("started_at")
-except OSError:
-    print("no-daemon")
-    raise SystemExit
-except Exception:
-    print("unknown")
-    raise SystemExit
-try:
     if not started:
         raise ValueError("no started_at")
     started_at = datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
@@ -246,7 +245,6 @@ PY
 	case "$verdict" in
 	fresh) return 0 ;;
 	stale) return 1 ;;
-	no-daemon) return 3 ;;
 	*) return 2 ;;
 	esac
 }
