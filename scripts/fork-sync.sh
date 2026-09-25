@@ -281,14 +281,20 @@ PY
 installed=0
 settled=0
 restart_attempted=0
+restart_succeeded=0
 on_exit() {
 	status=$?
 	if [ "$installed" = 1 ] && [ "$settled" = 0 ]; then
 		log "rolling back to $old_version"
 		install -m 755 "$BACKUP" "$BIN" || log "rollback failed; restore $BACKUP by hand"
 		if [ "$restart_attempted" = 1 ]; then
-			daemon_restart >/dev/null 2>&1 ||
-				log "the daemon still runs the new build; restart it once it is idle"
+			if ! daemon_restart >/dev/null 2>&1; then
+				if [ "$restart_succeeded" = 1 ]; then
+					log "the daemon still runs the new build; restart it once it is idle"
+				else
+					log "the daemon was not restarted; start it once it is idle"
+				fi
+			fi
 		fi
 	fi
 	cleanup
@@ -310,6 +316,7 @@ if [ "$(git -C "$WORKDIR" rev-parse HEAD)" = "$before_head" ] && cmp -s "$BUILT"
 else
 	restart_attempted=1
 	daemon_restart || die "daemon restart failed (the previous binary is restored)"
+	restart_succeeded=1
 
 	fresh_rc=0
 	daemon_fresh "${NM_HOME:-$HOME/.no-mistakes}/daemon.pid" "$BIN" || fresh_rc=$?

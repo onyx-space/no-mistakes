@@ -14,7 +14,8 @@ skill 本体。
 共享 skill 目录不由会话写入，把本文件装进去是操作者的动作：
 
 ```sh
-install -Dm644 ~/code/no-mistakes/scripts/fork-sync.md \
+mkdir -p ~/.agents/skills/no-mistakes-fork-sync
+install -m644 ~/code/no-mistakes/scripts/fork-sync.md \
   ~/.agents/skills/no-mistakes-fork-sync/SKILL.md
 ```
 
