@@ -79,7 +79,9 @@ install -m644 ~/code/no-mistakes/scripts/fork-sync.md \
 8. 任何失败：回滚到备份（并尝试把 daemon 指回旧构建），退出非零。
 
 幂等：对已同步的 fork 再跑一次，merge 无事可做、build 出**同版本戳**的产物（`make build` 会把
-构建时间嵌进去，所以字节不同、版本相同），install 与 daemon 重启都跳过。判据是
+构建时间嵌进去，所以字节不同、版本相同）；已装二进制就是该版本戳、且运行中的 daemon 也在跑
+这份构建时，install 与 daemon 重启都跳过。若 daemon 早于该二进制（比如上次换完二进制但没重启
+成功），脚本仍会走 install/restart，不会让 CLI 与 daemon 停在两个构建上。判据是
 `no-mistakes --version` 的版本戳（= 该分支的 `git describe`），不是字节。
 
 ## 常见坑
