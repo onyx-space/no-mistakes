@@ -15,9 +15,11 @@
 # version stamp have both been verified, and any failure after the replacement
 # restores the backup taken immediately before it.
 #
-# The flow is idempotent: a second run on an already-synced fork merges nothing,
-# rebuilds the same bytes, installs the same bytes, and does not bounce the
-# daemon.
+# The flow is idempotent: a second run on an already-synced fork merges nothing
+# and rebuilds to the same version stamp. `make build` embeds the build date, so
+# the bytes differ between runs; the version stamp is the criterion. When the
+# installed binary already carries that stamp and the running daemon serves it,
+# the run stops without reinstalling or bouncing the daemon.
 #
 # Run it from any directory; the repository is resolved from this file's own
 # location unless --repo is given.
@@ -55,7 +57,7 @@ while [ $# -gt 0 ]; do
 	--no-install) NO_INSTALL=1; shift ;;
 	--force)   FORCE=1; shift ;;
 	-h | --help)
-		sed -n '3,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+		awk 'NR < 3 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
 		exit 0
 		;;
 	*) die "unknown argument: $1 (try --help)" ;;
@@ -149,7 +151,9 @@ git -C "$REPO" fetch --prune upstream
 if preflight="$(git -C "$WORKDIR" merge-tree --write-tree HEAD upstream/main 2>&1)"; then
 	:
 elif printf '%s\n' "$preflight" | grep -q '^CONFLICT'; then
-	printf '%s\n' "$preflight" >&2
+	# merge-tree also prints the conflicted blob modes and object ids; the
+	# operator needs the file list, not the object table.
+	printf '%s\n' "$preflight" | grep -E '^(CONFLICT|Auto-merging)' >&2
 	die "merging upstream/main into $BRANCH conflicts (see above); resolve it by hand"
 else
 	log "note: merge preflight unavailable, continuing"
@@ -199,6 +203,79 @@ if [ "$NO_INSTALL" = 1 ]; then
 	exit 0
 fi
 
+daemon_restart() {
+	if [ "$FORCE" = 1 ]; then
+		"$BIN" daemon restart --force
+	else
+		"$BIN" daemon restart
+	fi
+}
+
+# Liveness comes from the binary's own health check, not from the pidfile: a
+# SIGKILLed daemon leaves behind a pidfile whose timestamp still looks fresh. The
+# daemon must also have started after the binary it now runs. daemon.pid records
+# the daemon's own start time at whole-second resolution (ps -o lstart=), so
+# both sides are compared floored to the second: a start in the same second as
+# the install is not read as stale.
+# Exit codes: 0 fresh, 1 stale, 2 unverifiable, 3 no daemon running.
+daemon_fresh() {
+	local pidfile="$1" bin="$2" verdict status_out
+	status_out="$(NO_MISTAKES_NO_UPDATE_CHECK=1 "$bin" daemon status 2>&1)" || return 3
+	case "$status_out" in
+	*"daemon running"*) ;;
+	*) return 3 ;;
+	esac
+	command -v python3 >/dev/null 2>&1 || return 2
+	verdict="$(python3 - "$pidfile" "$bin" <<'PY'
+import json, math, os, sys
+from datetime import datetime
+try:
+    with open(sys.argv[1]) as fh:
+        started = json.load(fh).get("started_at")
+    if not started:
+        raise ValueError("no started_at")
+    started_at = datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
+    installed_at = os.stat(sys.argv[2]).st_mtime
+except Exception:
+    print("unknown")
+else:
+    print("fresh" if math.floor(started_at) >= math.floor(installed_at) else "stale")
+PY
+)" || return 2
+	case "$verdict" in
+	fresh) return 0 ;;
+	stale) return 1 ;;
+	*) return 2 ;;
+	esac
+}
+
+# `make build` stamps the build date, so two builds of the same commit are not
+# byte-identical. The version stamp is what identifies the build: it carries the
+# commit, the tag distance, and whether the tree was dirty. Reinstalling and
+# bouncing the daemon for an identical version would be work with no effect, and
+# a second run must not disturb a daemon that is already serving this build.
+old_version="$("$BIN" --version | awk '{print $3}')"
+if [ "$old_version" = "$built_version" ]; then
+	fresh_rc=0
+	daemon_fresh "${NM_HOME:-$HOME/.no-mistakes}/daemon.pid" "$BIN" || fresh_rc=$?
+	case "$fresh_rc" in
+	1)
+		log "$BIN already is this build ($built_version), but the running daemon predates it; restarting"
+		;;
+	3)
+		log "$BIN already is this build ($built_version), but no daemon is running; starting it"
+		;;
+	*)
+		if [ "$fresh_rc" = 2 ]; then
+			log "note: could not verify the running daemon is this build; leaving it alone"
+		fi
+		log "$BIN already is this build ($built_version); leaving it and the daemon alone"
+		log "done"
+		exit 0
+		;;
+	esac
+fi
+
 # ---------------------------------------------------------------------------
 # 5. Replace the runtime, keeping the previous binary for rollback.
 # ---------------------------------------------------------------------------
@@ -231,52 +308,12 @@ elif [ -n "$runs" ]; then
 	log "note: could not read the pipeline run registry; the daemon restart below still refuses a busy daemon"
 fi
 
-old_version="$("$BIN" --version | awk '{print $3}')"
 BACKUP="$BACKUP_DIR/no-mistakes.bak-$old_version"
 mkdir -p "$BACKUP_DIR"
 if [ ! -f "$BACKUP" ]; then
 	cp -p "$BIN" "$BACKUP"
 	log "backed up $old_version to $BACKUP"
 fi
-
-daemon_restart() {
-	if [ "$FORCE" = 1 ]; then
-		"$BIN" daemon restart --force
-	else
-		"$BIN" daemon restart
-	fi
-}
-
-# The daemon must have started after the binary it now runs. daemon.pid records
-# the daemon's own start time at whole-second resolution (ps -o lstart=), so
-# both sides are compared floored to the second: a start in the same second as
-# the install is not read as stale.
-# Exit codes: 0 fresh, 1 stale, 2 unverifiable.
-daemon_fresh() {
-	local pidfile="$1" bin="$2" verdict
-	command -v python3 >/dev/null 2>&1 || return 2
-	verdict="$(python3 - "$pidfile" "$bin" <<'PY'
-import json, math, os, sys
-from datetime import datetime
-try:
-    with open(sys.argv[1]) as fh:
-        started = json.load(fh).get("started_at")
-    if not started:
-        raise ValueError("no started_at")
-    started_at = datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
-    installed_at = os.stat(sys.argv[2]).st_mtime
-except Exception:
-    print("unknown")
-else:
-    print("fresh" if math.floor(started_at) >= math.floor(installed_at) else "stale")
-PY
-)" || return 2
-	case "$verdict" in
-	fresh) return 0 ;;
-	stale) return 1 ;;
-	*) return 2 ;;
-	esac
-}
 
 installed=0
 settled=0
@@ -311,20 +348,16 @@ cmp -s "$BUILT" "$BIN" || die "the installed binary does not match the built one
 # 6. Point the daemon at the new build and verify the running process is it.
 # ---------------------------------------------------------------------------
 
-if [ "$(git -C "$WORKDIR" rev-parse HEAD)" = "$before_head" ] && cmp -s "$BUILT" "$BACKUP" 2>/dev/null; then
-	log "the installed binary already is this build; leaving the daemon alone"
-else
-	restart_attempted=1
-	daemon_restart || die "daemon restart failed (the previous binary is restored)"
-	restart_succeeded=1
+restart_attempted=1
+daemon_restart || die "daemon restart failed (the previous binary is restored)"
+restart_succeeded=1
 
-	fresh_rc=0
-	daemon_fresh "${NM_HOME:-$HOME/.no-mistakes}/daemon.pid" "$BIN" || fresh_rc=$?
-	if [ "$fresh_rc" = 1 ]; then
-		die "the running daemon predates the installed binary (the previous binary is restored)"
-	elif [ "$fresh_rc" = 2 ]; then
-		log "note: could not verify the running daemon is this build; continuing"
-	fi
+fresh_rc=0
+daemon_fresh "${NM_HOME:-$HOME/.no-mistakes}/daemon.pid" "$BIN" || fresh_rc=$?
+if [ "$fresh_rc" = 1 ]; then
+	die "the running daemon predates the installed binary (the previous binary is restored)"
+elif [ "$fresh_rc" != 0 ]; then
+	log "note: could not verify the running daemon is this build; continuing"
 fi
 
 settled=1

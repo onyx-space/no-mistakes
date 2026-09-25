@@ -38,8 +38,9 @@ install -m644 ~/code/no-mistakes/scripts/fork-sync.md \
 - **不打断在飞管线**：daemon 与 CLI 不能跑不同构建（生命周期闸就是为此存在的）。
   脚本在替换二进制**之前**读 `~/.no-mistakes/state.sqlite` 的 `runs` 表，有未终态 run
   就拒绝并列出，除非显式 `--force`（`--force` 同时透传给 `daemon restart`）。替换成功后用
-  `no-mistakes daemon restart` 让 daemon 吃上新构建；daemon 判据 = `daemon.pid` 记录的
-  进程启动时间（秒级）不早于二进制 mtime，读不到就告警继续。
+  `no-mistakes daemon restart` 让 daemon 吃上新构建；daemon 判据 = `"$BIN" daemon status`
+  自报在跑（存活信号，不信 pidfile），且 `daemon.pid` 记录的启动时间（秒级）不早于二进制
+  mtime；探测本身不可用（比如缺 python3）就告警继续。
 
 ## 用法
 
@@ -78,8 +79,13 @@ install -m644 ~/code/no-mistakes/scripts/fork-sync.md \
    `no-mistakes daemon restart` → 校验运行中的 daemon 进程晚于新二进制。
 8. 任何失败：回滚到备份（并尝试把 daemon 指回旧构建），退出非零。
 
-幂等：对已同步的 fork 再跑一次，merge 无事可做、build 出同样字节、install 同样字节、
-且**不重启 daemon**。
+幂等：对已同步的 fork 再跑一次，merge 无事可做、build 出**同版本戳**的产物（`make build` 会把
+构建时间嵌进去，所以字节不同、版本相同）；已装二进制就是该版本戳、且运行中的 daemon 也在跑
+这份构建时，install 与 daemon 重启都跳过。若 daemon 早于该二进制（比如上次换完二进制但没重启
+成功），或 daemon 没在跑（`"$BIN" daemon status` 报不在跑；SIGKILL 会留下一个时间戳看着还新的
+`daemon.pid`，硬重启后更是如此），脚本仍会走 install/restart，不会让 CLI 与 daemon 停在两个
+构建上、也不会留下一个没起来的运行时。判据是 `"$BIN" daemon status` 报在跑
+（= 二进制自己的 health check）加版本戳（= 该分支的 `git describe`），都不是字节。
 
 ## 常见坑
 
