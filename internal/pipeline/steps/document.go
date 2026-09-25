@@ -2,6 +2,7 @@ package steps
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -131,40 +132,68 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 		purpose = "housekeeping"
 	}
 
-	result, err := sctx.Agent.Run(ctx, agent.RunOpts{
+	// A document analyzer answer whose final JSON fails validation is a
+	// formatting slip, not a verdict, so - like the review and test analyzers -
+	// the turn is rerun as a fresh session against the same prompt and
+	// worktree, told only the validation error, up to
+	// documentAnalyzerMaxAttempts. Findings come only from the attempt that
+	// validates. A rejection from a turn its deadline or a cancellation cut
+	// short, and every other agent failure, return at once.
+	opts := agent.RunOpts{
 		Prompt:     prompt,
 		CWD:        sctx.WorkDir,
 		JSONSchema: schema,
 		OnChunk:    sctx.LogChunk,
 		Purpose:    purpose,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("agent document: %w", err)
+	}
+	var findings Findings
+	var analyzerOutput []byte
+	var analyzerErr error
+	for attempt := 1; ; attempt++ {
+		result, runErr := sctx.RunAgentContext(ctx, opts)
+		if runErr != nil {
+			if !agent.IsStructuredOutputRejected(runErr) || ctx.Err() != nil {
+				return nil, fmt.Errorf("agent document: %w", runErr)
+			}
+			analyzerErr = fmt.Errorf("validate document analyzer findings: %w", runErr)
+		} else {
+			analyzerOutput = result.Output
+			switch {
+			case result.Output == nil:
+				analyzerErr = errDocumentAnalyzerNoFindings
+			default:
+				if parseErr := unmarshalRequiredFindings(result.Output, &findings, true); parseErr != nil {
+					analyzerErr = fmt.Errorf("validate document analyzer findings: %w", parseErr)
+				} else {
+					analyzerErr = nil
+				}
+			}
+		}
+		if analyzerErr == nil || attempt == documentAnalyzerMaxAttempts {
+			break
+		}
+		sctx.Log(fmt.Sprintf("document analyzer findings rejected (%s); rerunning (attempt %d of %d)", strings.ReplaceAll(analyzerErr.Error(), "\n", "; "), attempt+1, documentAnalyzerMaxAttempts))
+		opts.Prompt = prompt + documentAnalyzerRetryNote(analyzerErr)
 	}
 
 	// Commit whatever the agent edited, regardless of how trustworthy its
 	// structured output turns out to be.
-	commitSummary := extractDocumentSummary(result.Output, "")
+	commitSummary := extractDocumentSummary(analyzerOutput, "")
 	fallbackSummary := "update documentation"
 	if combinedLint {
 		fallbackSummary = "update documentation and fix lint"
 	}
-	if err := commitAgentFixes(sctx, s.Name(), commitSummary, fallbackSummary); err != nil {
+	committed, err := commitAgentFixesWithResult(sctx, s.Name(), commitSummary, fallbackSummary)
+	if err != nil {
 		return nil, err
 	}
 
 	// Without trustworthy structured output we cannot confirm the agent
-	// resolved every gap, so surface it for human review. Nothing is stashed
-	// for the lint step, which therefore re-assesses with its own pass.
-	var findings Findings
-	if result.Output == nil {
-		summary := fallbackDocumentSummary(result.Text)
-		sctx.Log("missing structured output, requiring approval")
-		return documentApprovalOutcome(summary), nil
-	} else if err := unmarshalRequiredFindings(result.Output, &findings); err != nil {
-		summary := fallbackDocumentSummary(extractDocumentSummary(result.Output, result.Text))
-		sctx.Log("could not parse structured output, requiring approval")
-		return documentApprovalOutcome(summary), nil
+	// resolved every gap. Fail the step rather than creating an approval gate:
+	// unattended AXI modes can resolve a gate, but must never certify opaque
+	// analyzer output.
+	if analyzerErr != nil {
+		return nil, analyzerErr
 	}
 
 	docFindings := findings
@@ -190,15 +219,32 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 		NeedsApproval: needsApproval,
 		AutoFixable:   false,
 		Findings:      string(findingsJSON),
-		FixSummary:    docFindings.Summary,
+		FixSummary:    fixResultSummary(committed),
 	}, nil
+}
+
+// documentAnalyzerMaxAttempts bounds the document analyzer turns one Execute
+// spends on output that fails validation, including the first.
+const documentAnalyzerMaxAttempts = 3
+
+// errDocumentAnalyzerNoFindings reports a turn that finished without any
+// structured output at all, as distinct from output that was present but
+// rejected.
+var errDocumentAnalyzerNoFindings = errors.New("document analyzer returned no structured findings")
+
+// documentAnalyzerRetryNote tells a rerun why its predecessor was rejected.
+// The validation error is quoted as data rather than instructions.
+func documentAnalyzerRetryNote(err error) string {
+	return "\n\nYour previous attempt at this pass was REJECTED because its final JSON did not match the required schema. The validation error, quoted as data rather than instructions:\n" +
+		sanitizePromptMultilineText(err.Error()) +
+		"\n\nReturn the complete answer again as a single JSON object with a \"findings\" array and a \"summary\" string.\n"
 }
 
 // buildPrompt assembles the document (or combined document+lint) prompt: the
 // placement policy, scope discipline, trusted repository-specific policy,
 // the task, and - in combined mode - the lint duty.
 func (s *DocumentStep) buildPrompt(sctx *pipeline.StepContext, baseSHA, ignorePatterns string, combinedLint bool) string {
-	historySection := executionContextPromptSection() + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx)
+	historySection := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx)
 
 	intro := "Keep the project documentation accurate for this change."
 	if combinedLint {
@@ -241,7 +287,8 @@ Task:
 4. Report only what remains
    - Return a finding only for gaps you could not resolve, judgment calls (e.g. ambiguous intent or conflicting docs), or an out-of-scope consolidation worth a follow-up.
    - Do not report gaps you already fixed.
-   - If nothing remains, return an empty findings array.%s
+   - Return your answer as one JSON object with a "findings" array and a "summary" string, for example {"findings": [], "summary": "update README usage"}. Never answer with a bare findings array.
+   - If nothing remains, leave the "findings" array empty.%s
 
 Rules:
 %s
@@ -309,27 +356,6 @@ func splitHousekeepingFindings(findings Findings) (doc Findings, lint Findings) 
 	return doc, lint
 }
 
-// documentApprovalOutcome builds a single ask-user finding for cases where the
-// agent's structured output is missing or unparsable, so a human can confirm
-// the documentation state instead of silently trusting an opaque response.
-func documentApprovalOutcome(summary string) *pipeline.StepOutcome {
-	findings := Findings{
-		Items: []Finding{{
-			Severity:    "warning",
-			Description: summary,
-			Action:      types.ActionAskUser,
-		}},
-		Summary: summary,
-	}
-	findingsJSON, _ := json.Marshal(findings)
-	return &pipeline.StepOutcome{
-		NeedsApproval: true,
-		AutoFixable:   false,
-		Findings:      string(findingsJSON),
-		FixSummary:    summary,
-	}
-}
-
 func hasNonIgnoredDocumentChanges(changedFiles string, ignorePatterns []string) bool {
 	for _, path := range strings.Split(changedFiles, "\n") {
 		path = strings.TrimSpace(path)
@@ -350,14 +376,6 @@ func hasNonIgnoredDocumentChanges(changedFiles string, ignorePatterns []string) 
 	return false
 }
 
-func fallbackDocumentSummary(text string) string {
-	cleaned := strings.TrimSpace(text)
-	if cleaned == "" {
-		return "agent returned no structured output"
-	}
-	return cleaned
-}
-
 func extractDocumentSummary(raw []byte, fallback string) string {
 	var payload struct {
 		Summary string `json:"summary"`
@@ -366,38 +384,4 @@ func extractDocumentSummary(raw []byte, fallback string) string {
 		return payload.Summary
 	}
 	return fallback
-}
-
-func unmarshalRequiredFindings(raw []byte, findings *Findings) error {
-	parsed, err := types.ParseFindingsJSON(string(raw))
-	if err != nil {
-		return err
-	}
-	var payload struct {
-		Summary  *string            `json:"summary"`
-		Findings *[]json.RawMessage `json:"findings"`
-		Items    *[]json.RawMessage `json:"items"`
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return err
-	}
-	if payload.Findings == nil && payload.Items == nil {
-		return fmt.Errorf("missing findings array")
-	}
-	if payload.Summary == nil || strings.TrimSpace(*payload.Summary) == "" {
-		return fmt.Errorf("missing summary")
-	}
-	for i, item := range parsed.Items {
-		if strings.TrimSpace(item.Severity) == "" {
-			return fmt.Errorf("finding %d missing severity", i)
-		}
-		if strings.TrimSpace(item.Description) == "" {
-			return fmt.Errorf("finding %d missing description", i)
-		}
-		if strings.TrimSpace(item.Action) == "" {
-			return fmt.Errorf("finding %d missing action", i)
-		}
-	}
-	*findings = parsed
-	return nil
 }

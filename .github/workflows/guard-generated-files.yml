@@ -25,7 +25,15 @@ jobs:
     runs-on: ubuntu-latest
     # release-please owns CHANGELOG.md and .release-please-manifest.json; its PR
     # is the one legitimate place those files change, so we exempt its author.
+    #
+    # The guard protects the upstream release-please line, so it runs there only.
+    # A fork that carries this workflow (onyx-space/no-mistakes) advances its main
+    # by merging upstream, and that merge brings upstream's own release commits
+    # for both files; a name diff cannot tell that generated output apart from a
+    # hand-edit, so the check would fail every sync PR on the fork. Declare it
+    # skipped there rather than weaken the check where it applies.
     if: >-
+      github.repository == 'kunchenguid/no-mistakes' &&
       github.event.pull_request.user.login != 'github-actions[bot]' &&
       github.event.pull_request.user.login != 'release-please[bot]'
     steps:

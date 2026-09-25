@@ -7,9 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
+	"reflect"
 	"strings"
 	"time"
+	"unicode"
 
+	"github.com/kunchenguid/no-mistakes/internal/agentcfg"
+	"github.com/kunchenguid/no-mistakes/internal/runenv"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -39,8 +44,8 @@ type RunOpts struct {
 	// a failed resume. Instrumentation only; adapters ignore it.
 	SessionFallback bool
 	// Purpose labels the pipeline duty this invocation serves (review,
-	// review-fix, test-evidence, ...). Instrumentation only; adapters
-	// ignore it.
+	// review-fix, test-evidence, ...). The review-role router uses review and
+	// review-fix to select a harness; concrete adapters ignore it.
 	Purpose string
 	// SessionFallbackReason is the low-cardinality reason a failed resume forced
 	// this fresh-session retry (see db.FallbackReason*). Set only when
@@ -55,6 +60,30 @@ type RunOpts struct {
 	// fallback-provider attempts, after it completes. It is instrumentation
 	// only and must not change invocation behavior.
 	OnAttempt func(Attempt)
+}
+
+// IsStructuredOutputRejected reports whether an invocation completed but its
+// final structured response was absent, malformed, or rejected by the requested
+// schema. Callers may use this distinction to ask the same agent to correct its
+// response without treating provider, process, or timeout failures as bad JSON.
+func IsStructuredOutputRejected(err error) bool {
+	var rejection interface {
+		StructuredOutputRejected() bool
+	}
+	return errors.As(err, &rejection) && rejection.StructuredOutputRejected()
+}
+
+type structuredOutputRejection struct{ err error }
+
+func (e *structuredOutputRejection) Error() string                { return e.err.Error() }
+func (e *structuredOutputRejection) Unwrap() error                { return e.err }
+func (*structuredOutputRejection) StructuredOutputRejected() bool { return true }
+
+func rejectStructuredOutput(err error) error {
+	if err == nil || IsStructuredOutputRejected(err) {
+		return err
+	}
+	return &structuredOutputRejection{err: err}
 }
 
 // Attempt describes one completed concrete adapter attempt for an agent
@@ -201,10 +230,12 @@ type Result struct {
 	// Resumed reports whether this invocation resumed opts.Session.ID.
 	Resumed bool
 	// Model is the model the adapter reported serving this invocation, when
-	// available. Instrumentation only.
+	// available. Instrumentation records it, and eval replay validates it
+	// against the requested candidate.
 	Model string
 	// ModelProvider is the provider that served the model (e.g. "openai",
-	// "anthropic"), when the adapter can report it. Instrumentation only.
+	// "anthropic"), when the adapter can report it. Instrumentation records it
+	// as telemetry; eval model identity matching deliberately ignores it.
 	ModelProvider string
 	// Provider is the adapter provider that served this invocation. It lets
 	// fallback wrappers persist a session against the provider that minted it.
@@ -233,7 +264,10 @@ type TokenUsage struct {
 	CacheCreationTokens int
 	// ReasoningTokens is the output tokens the model spent on hidden reasoning,
 	// when the provider reports it separately. Zero when not reported.
-	ReasoningTokens       int
+	ReasoningTokens int
+	// ReasoningReported distinguishes a genuine zero from an adapter that does
+	// not expose reasoning usage.
+	ReasoningReported     bool
 	Reported              bool
 	CacheCreationReported bool
 }
@@ -250,25 +284,38 @@ type InvocationWorkload struct {
 // targets, to raw ACP agent commands.
 type Options struct {
 	ACPRegistryOverrides map[string]string
+	Environment          runenv.Overlay
 	// DisableProjectSettings, when true, asks a supported adapter (codex,
 	// claude, pi) to launch with the target repo's project-level agent
 	// settings/instructions suppressed. It is the resolved, trusted-only opt-out
 	// from config.Config; adapters without a verified suppression knob ignore it
 	// and are refused separately by EnsureGateNeutralized when the opt-out is on.
 	DisableProjectSettings bool
+	// Profile is the harness-neutral model/effort selection (see
+	// internal/agentcfg). NewWithOptions maps it down to whatever mechanism the
+	// named harness actually uses - injected argv flags for most CLIs, the
+	// session-message body for opencode, acpx's own --model for ACP targets -
+	// and refuses a knob the harness cannot express. A zero Profile leaves every
+	// harness on its own defaults, which is what every configuration that
+	// predates the common layer resolves to.
+	Profile agentcfg.Profile
 }
 
 func finalizeTextResult(agentName, text string, schema json.RawMessage, usage TokenUsage) (*Result, error) {
 	if text == "" {
-		return nil, fmt.Errorf("%s returned no text output", agentName)
+		err := fmt.Errorf("%s returned no text output", agentName)
+		if len(schema) > 0 {
+			return nil, rejectStructuredOutput(err)
+		}
+		return nil, err
 	}
 	if len(schema) == 0 {
 		return &Result{Text: text, Usage: usage, UsageReported: usage.Reported, CacheCreationReported: usage.CacheCreationReported}, nil
 	}
 
-	output, err := parseStructuredTextOutput(text, schema)
+	output, err := parseStructuredTextOutput(text, schema, strings.HasPrefix(agentName, "acp:"))
 	if err != nil {
-		return nil, fmt.Errorf("%s output parse: %w (output snippet: %q)", agentName, err, outputSnippet(text))
+		return nil, rejectStructuredOutput(fmt.Errorf("%s output parse: %w (output snippet: %q)", agentName, err, outputSnippet(text)))
 	}
 
 	return &Result{Output: output, Text: text, Usage: usage, UsageReported: usage.Reported, CacheCreationReported: usage.CacheCreationReported}, nil
@@ -287,7 +334,7 @@ func outputSnippet(text string) string {
 	return trimmed
 }
 
-func parseStructuredTextOutput(text string, schema json.RawMessage) (json.RawMessage, error) {
+func parseStructuredTextOutput(text string, schema json.RawMessage, preferTerminal bool) (json.RawMessage, error) {
 	validationSchema, err := textValidationSchema(schema)
 	if err != nil {
 		return nil, err
@@ -298,35 +345,83 @@ func parseStructuredTextOutput(text string, schema json.RawMessage) (json.RawMes
 		return output, nil
 	}
 
-	candidates := fencedJSONCandidates(text)
-	var parsed []json.RawMessage
+	closed, openCands := fencedJSONCandidates(text)
+
 	var candidateErr error
-	for _, candidate := range candidates {
-		fenced, err := parseStructuredCandidate([]byte(candidate), validationSchema)
-		if err == nil {
-			parsed = append(parsed, fenced)
-			continue
+	parseCandidates := func(cands []string) []json.RawMessage {
+		var parsed []json.RawMessage
+		for _, candidate := range cands {
+			fenced, err := parseStructuredCandidate([]byte(candidate), validationSchema)
+			if err == nil {
+				parsed = append(parsed, fenced)
+				continue
+			}
+			if candidateErr == nil {
+				candidateErr = err
+			}
 		}
-		if candidateErr == nil {
-			candidateErr = err
-		}
+		return parsed
 	}
-	switch len(parsed) {
-	case 0:
-	case 1:
-		return parsed[0], nil
-	default:
+	// Closed fences are the canonical structured-output shape and win over
+	// open (unclosed, pi JSONL) candidates: prose that quotes ```json as an
+	// inline example never shadows a real trailing block, and an unclosed
+	// fence never competes with a closed one. Only when no closed fence
+	// parses do we consult the open candidates.
+	closedParsed := parseCandidates(closed)
+	if len(closedParsed) > 1 {
+		return nil, fmt.Errorf("multiple JSON code fences found in output")
+	}
+	openParsed := parseCandidates(openCands)
+	if len(openParsed) > 1 {
 		return nil, fmt.Errorf("multiple JSON code fences found in output")
 	}
 
-	if bare, err := lastBareJSONObject(text, validationSchema); err == nil && bare != nil {
-		return bare, nil
-	} else if candidateErr == nil && err != nil {
-		candidateErr = err
+	var fenced json.RawMessage
+	if len(closedParsed) == 1 {
+		fenced = closedParsed[0]
+	} else if len(openParsed) == 1 {
+		fenced = openParsed[0]
+	}
+
+	bareParsed, bareErr := bareJSONObjects(text, validationSchema)
+	if len(bareParsed) > 1 {
+		if !preferTerminal {
+			return nil, fmt.Errorf("multiple bare JSON objects found in output")
+		}
+		bareParsed = bareParsed[len(bareParsed)-1:]
+	}
+	if fenced != nil && len(bareParsed) == 1 {
+		if !jsonEqual(fenced, bareParsed[0]) {
+			return nil, fmt.Errorf("conflicting JSON candidates found in output")
+		}
+		return fenced, nil
+	}
+	if fenced != nil {
+		return fenced, nil
+	}
+	if len(bareParsed) == 1 {
+		return bareParsed[0], nil
+	}
+	if candidateErr == nil && bareErr != nil {
+		candidateErr = bareErr
+	}
+
+	// A whole-output JSON document is authoritative: when the entire text
+	// decodes as one JSON value, its own schema error is the real diagnosis.
+	// A candidate scraped out of the middle of it - for example each element
+	// object inside a top-level array - must not mask that with a narrower
+	// error such as "missing required field findings".
+	if _, err := decodeJSONValue([]byte(text)); err == nil {
+		return nil, rawErr
 	}
 
 	if candidateErr != nil {
 		return nil, candidateErr
+	}
+
+	trimmedText := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmedText, "{") {
+		return nil, fmt.Errorf("ended its turn with prose instead of the required JSON object")
 	}
 	return nil, rawErr
 }
@@ -348,53 +443,52 @@ func textValidationSchema(schema json.RawMessage) (json.RawMessage, error) {
 // Fence markers may appear anywhere in the text, including glued to the end
 // of a preceding line (e.g. "...behavior.```json"), which is a shape real
 // codex/GPT-5 output regularly produces.
-func fencedJSONCandidates(text string) []string {
-	var candidates []string
+//
+// Candidates are split into two groups. closed holds bodies of fences with
+// a matching closing fence (the canonical shape); open holds bodies of
+// fences with no closing fence, where the body runs to the end of the text
+// (the pi JSONL shape). The scan never stops at the first opener: an opener
+// whose candidate spans unrelated prose (e.g. prose quoting ```json as an
+// inline example) must not swallow a later, real fence block.
+func fencedJSONCandidates(text string) (closed, open []string) {
 	rest := text
 	for {
-		start := indexJSONFenceOpen(rest)
-		if start < 0 {
-			return candidates
+		marker := strings.Index(rest, "```")
+		if marker < 0 {
+			return closed, open
 		}
-		body := rest[start:]
-		end, next := indexJSONFenceClose(body)
+		contentStart, info := fenceContentStart(rest, marker)
+		if !strings.EqualFold(strings.TrimSpace(info), "json") {
+			// Not a JSON fence: skip it (or its whole block) and keep
+			// scanning for a real opener.
+			after := skipFenceBlock(rest[contentStart:])
+			if after < 0 {
+				after = 0
+			}
+			rest = rest[contentStart+after:]
+			continue
+		}
+		body := rest[contentStart:]
+		end, _ := indexJSONFenceClose(body)
 		if end < 0 {
-			// No closing fence: some agents (notably pi JSONL streams) emit an
-			// opening ```json fence glued to a JSON body that runs to the end
-			// of the output with no closing fence. Take everything after the
-			// opener as a candidate; parseStructuredCandidate validates it
-			// later and only adopts it when it is actually valid JSON.
-			candidates = append(candidates, body)
-			return candidates
+			// No closing fence: the JSON body runs to the end of the output
+			// (pi JSONL shape). Take everything after the opener as an open
+			// candidate; parseStructuredCandidate validates it later and
+			// only adopts it when it is actually valid JSON.
+			open = append(open, body)
+			return closed, open
 		}
-		candidates = append(candidates, body[:end])
-		rest = body[next:]
+		closed = append(closed, body[:end])
+		// Resume after the opener marker, not after this candidate's closing
+		// fence: an unvalidated candidate may span unrelated text, and a
+		// later real block must still be discovered on its own.
+		rest = rest[marker+3:]
 	}
 }
 
-// indexJSONFenceOpen returns the byte offset of the content immediately
-// following an opening ```json fence (the char after the info line's
-// newline), or -1 if no opener exists.
-func indexJSONFenceOpen(text string) int {
-	for searchStart := 0; searchStart < len(text); {
-		i := strings.Index(text[searchStart:], "```")
-		if i < 0 {
-			return -1
-		}
-		i += searchStart
-		contentStart, info := fenceContentStart(text, i)
-		if strings.EqualFold(strings.TrimSpace(info), "json") {
-			return contentStart
-		}
-		next := skipFenceBlock(text[contentStart:])
-		if next < 0 {
-			return -1
-		}
-		searchStart = contentStart + next
-	}
-	return -1
-}
-
+// fenceContentStart returns the byte offset where a fence's content begins
+// (immediately after the info token and any following newline) plus the
+// parsed info token itself.
 func fenceContentStart(text string, fenceStart int) (int, string) {
 	after := text[fenceStart+3:]
 	lineEnd := strings.IndexByte(after, '\n')
@@ -487,18 +581,36 @@ func indexJSONFenceClose(text string) (int, int) {
 	return -1, -1
 }
 
-// lastBareJSONObject scans text for balanced {...} substrings that parse
-// as JSON and returns the last one found. This handles models that emit
-// reasoning prose followed by a raw JSON answer, with no code fence.
-func lastBareJSONObject(text string, schema json.RawMessage) (json.RawMessage, error) {
-	var last json.RawMessage
+// bareObject is one balanced {...} span found outside code fences, with the
+// schema-validated object (nil when the span failed validation) and its byte
+// span.
+type bareObject struct {
+	obj        json.RawMessage
+	raw        []byte
+	startIndex int
+	endIndex   int
+}
+
+// bareJSONObjects scans text for balanced {...} substrings outside code fences
+// that parse as JSON and validate against the schema. Only concluding objects
+// are candidates; an incidental object followed by substantive prose is not a
+// verdict, and provider protocol residue after a complete object is. A single
+// answer split across adjacent objects is returned as their union when their
+// keys are disjoint and the union validates (see fuseAdjacentBareObjects).
+func bareJSONObjects(text string, schema json.RawMessage) ([]json.RawMessage, error) {
+	var valid []bareObject
+	var objects []bareObject
 	var lastErr error
 	for i := 0; i < len(text); i++ {
 		if strings.HasPrefix(text[i:], "```") {
 			contentStart, _ := fenceContentStart(text, i)
 			next := skipFenceBlock(text[contentStart:])
 			if next < 0 {
-				break
+				// An unpaired fence marker (e.g. ```json quoted inside prose)
+				// must not abort the scan of the whole output; skip the marker
+				// itself and keep looking for a bare object.
+				i += 2
+				continue
 			}
 			i = contentStart + next - 1
 			continue
@@ -511,19 +623,266 @@ func lastBareJSONObject(text string, schema json.RawMessage) (json.RawMessage, e
 			continue
 		}
 		candidate := text[i:end]
+		entry := bareObject{raw: []byte(candidate), startIndex: i, endIndex: end}
 		obj, err := parseStructuredCandidate([]byte(candidate), schema)
 		if err == nil {
-			last = obj
+			entry.obj = obj
+			valid = append(valid, entry)
 			lastErr = nil
 		} else if lastErr == nil {
 			lastErr = err
 		}
+		objects = append(objects, entry)
 		i = end - 1
 	}
-	if last != nil {
-		return last, nil
+	if len(valid) > 1 {
+		parsed := make([]json.RawMessage, 0, len(valid))
+		for _, candidate := range valid {
+			parsed = append(parsed, candidate.obj)
+		}
+		return parsed, nil
+	}
+	if len(valid) == 1 && trailingNonJSONResidue(text[valid[0].endIndex:]) {
+		return []json.RawMessage{valid[0].obj}, nil
+	}
+	if len(valid) == 0 {
+		if fused, ok := fuseAdjacentBareObjects(text, objects, schema); ok {
+			return []json.RawMessage{fused}, nil
+		}
 	}
 	return nil, lastErr
+}
+
+// trailingNonJSONResidue reports whether rest - the text following a single
+// schema-valid bare object - is provider protocol residue rather than a second
+// structured answer or a prose continuation. Providers occasionally append
+// stray closing tool-call delimiters after a complete JSON object (DeepSeek's
+// DSML markers with full-width separators are the observed case). A prose
+// sentence, or anything containing another JSON object or a code fence, is
+// never treated as residue.
+func trailingNonJSONResidue(rest string) bool {
+	trimmed := strings.TrimSpace(rest)
+	if trimmed == "" {
+		return true
+	}
+	if strings.Contains(rest, "{") || strings.Contains(rest, "```") {
+		return false
+	}
+	for _, token := range strings.Fields(trimmed) {
+		if isProtocolResidueToken(token) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// isProtocolResidueToken accepts one whitespace-delimited piece of provider
+// tool-protocol residue: a markup tag such as </invoke> (optionally carrying
+// DeepSeek's full-width DSML separators), or a run of punctuation with no
+// letters or digits, such as a stray closing brace. Ordinary prose words fail
+// both tests, so a prose continuation is still rejected.
+func isProtocolResidueToken(token string) bool {
+	if strings.Contains(token, "<") && strings.Contains(token, ">") {
+		return true
+	}
+	return !strings.ContainsFunc(token, func(r rune) bool {
+		return unicode.IsLetter(r) || unicode.IsDigit(r)
+	})
+}
+
+// fuseAdjacentBareObjects merges runs of adjacent top-level objects whose keys
+// are disjoint, returning the merged object when it validates against the full
+// schema. Models sometimes split one structured answer across two objects (for
+// example {"findings":...} then {"risk_level":...}); each half fails
+// validation alone while the union satisfies it. Adjacent means only whitespace
+// separates the objects, and no key may repeat across the run, so two competing
+// verdicts embedded in prose are never fused. A run counts only when it is
+// concluding, on the same rule as the single-object path: anything other than
+// protocol residue after the run means the objects were quoted mid-answer, not
+// answered.
+func fuseAdjacentBareObjects(text string, objects []bareObject, schema json.RawMessage) (json.RawMessage, bool) {
+	for i := 0; i < len(objects); {
+		j := i
+		for j+1 < len(objects) && strings.TrimSpace(text[objects[j].endIndex:objects[j+1].startIndex]) == "" {
+			j++
+		}
+		if j > i && trailingNonJSONResidue(text[objects[j].endIndex:]) {
+			if fused, ok := fuseBareObjects(objects[i:j+1], schema); ok {
+				return fused, true
+			}
+		}
+		i = j + 1
+	}
+	return nil, false
+}
+
+func fuseBareObjects(objects []bareObject, schema json.RawMessage) (json.RawMessage, bool) {
+	merged := make(map[string]json.RawMessage)
+	for _, object := range objects {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(object.raw, &fields); err != nil {
+			return nil, false
+		}
+		for key, value := range fields {
+			if _, exists := merged[key]; exists {
+				return nil, false
+			}
+			merged[key] = value
+		}
+	}
+	fused, err := json.Marshal(merged)
+	if err != nil {
+		return nil, false
+	}
+	out, err := parseStructuredCandidate(fused, schema)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+func jsonEqual(a, b json.RawMessage) bool {
+	if bytes.Equal(bytes.TrimSpace(a), bytes.TrimSpace(b)) {
+		return true
+	}
+	valA, err := decodeJSONValue(a)
+	if err != nil {
+		return false
+	}
+	valB, err := decodeJSONValue(b)
+	if err != nil {
+		return false
+	}
+	return jsonValuesEqual(valA, valB)
+}
+
+func jsonValuesEqual(a, b any) bool {
+	switch valueA := a.(type) {
+	case json.Number:
+		valueB, ok := b.(json.Number)
+		if !ok {
+			return false
+		}
+		return jsonNumbersEqual(valueA, valueB)
+	case map[string]any:
+		valueB, ok := b.(map[string]any)
+		if !ok || len(valueA) != len(valueB) {
+			return false
+		}
+		for key, childA := range valueA {
+			childB, ok := valueB[key]
+			if !ok || !jsonValuesEqual(childA, childB) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		valueB, ok := b.([]any)
+		if !ok || len(valueA) != len(valueB) {
+			return false
+		}
+		for i := range valueA {
+			if !jsonValuesEqual(valueA[i], valueB[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return reflect.DeepEqual(a, b)
+	}
+}
+
+type jsonDecimal struct {
+	negative bool
+	digits   string
+	power    *big.Int
+}
+
+func jsonNumbersEqual(a, b json.Number) bool {
+	decimalA, ok := parseJSONDecimal(a)
+	if !ok {
+		return false
+	}
+	decimalB, ok := parseJSONDecimal(b)
+	if !ok {
+		return false
+	}
+	if decimalA.digits == "" || decimalB.digits == "" {
+		return decimalA.digits == decimalB.digits
+	}
+	if decimalA.negative != decimalB.negative {
+		return false
+	}
+
+	orderA := decimalOrder(decimalA)
+	orderB := decimalOrder(decimalB)
+	if orderA.Cmp(orderB) != 0 {
+		return false
+	}
+
+	maxDigits := len(decimalA.digits)
+	if len(decimalB.digits) > maxDigits {
+		maxDigits = len(decimalB.digits)
+	}
+	for i := 0; i < maxDigits; i++ {
+		digitA, digitB := byte('0'), byte('0')
+		if i < len(decimalA.digits) {
+			digitA = decimalA.digits[i]
+		}
+		if i < len(decimalB.digits) {
+			digitB = decimalB.digits[i]
+		}
+		if digitA != digitB {
+			return false
+		}
+	}
+	return true
+}
+
+func parseJSONDecimal(number json.Number) (jsonDecimal, bool) {
+	raw := number.String()
+	negative := strings.HasPrefix(raw, "-")
+	if negative {
+		raw = raw[1:]
+	}
+
+	exponent := new(big.Int)
+	mantissa := raw
+	if exponentIndex := strings.IndexAny(raw, "eE"); exponentIndex >= 0 {
+		mantissa = raw[:exponentIndex]
+		exponentText := raw[exponentIndex+1:]
+		if strings.HasPrefix(exponentText, "+") {
+			exponentText = exponentText[1:]
+		}
+		if exponentText == "" {
+			return jsonDecimal{}, false
+		}
+		if _, ok := exponent.SetString(exponentText, 10); !ok {
+			return jsonDecimal{}, false
+		}
+	}
+
+	fractionalPart := ""
+	if dotIndex := strings.IndexByte(mantissa, '.'); dotIndex >= 0 {
+		fractionalPart = mantissa[dotIndex+1:]
+		mantissa = mantissa[:dotIndex] + fractionalPart
+	}
+
+	digits := strings.TrimLeft(mantissa, "0")
+	if digits == "" {
+		return jsonDecimal{}, true
+	}
+	trimmedDigits := strings.TrimRight(digits, "0")
+	trailingZeros := len(digits) - len(trimmedDigits)
+	power := new(big.Int).Sub(exponent, big.NewInt(int64(len(fractionalPart))))
+	power.Add(power, big.NewInt(int64(trailingZeros)))
+	return jsonDecimal{negative: negative, digits: trimmedDigits, power: power}, true
+}
+
+func decimalOrder(decimal jsonDecimal) *big.Int {
+	order := new(big.Int).Set(decimal.power)
+	return order.Add(order, big.NewInt(int64(len(decimal.digits))))
 }
 
 // scanBalancedObject returns the exclusive end index of a brace-balanced
@@ -629,6 +988,26 @@ func decodeJSONValue(raw []byte) (any, error) {
 	return value, nil
 }
 
+// jsonTypeName names the decoded JSON type a schema type check rejected, so a
+// shape mismatch reads as "must be object (received array)" rather than only
+// stating the expectation.
+func jsonTypeName(value any) string {
+	switch value.(type) {
+	case nil:
+		return "null"
+	case map[string]any:
+		return "object"
+	case []any:
+		return "array"
+	case string:
+		return "string"
+	case bool:
+		return "boolean"
+	default:
+		return "number"
+	}
+}
+
 func validateJSONValue(value, schema any, path string) error {
 	schemaMap, ok := schema.(map[string]any)
 	if !ok {
@@ -640,7 +1019,7 @@ func validateJSONValue(value, schema any, path string) error {
 	}
 
 	if types, ok := schemaTypes(schemaMap); ok && !matchesAnyType(value, types) {
-		return fmt.Errorf("%smust be %s", formatJSONPath(path), strings.Join(types, " or "))
+		return fmt.Errorf("%smust be %s (received %s)", formatJSONPath(path), strings.Join(types, " or "), jsonTypeName(value))
 	}
 
 	if object, ok := value.(map[string]any); ok {
@@ -813,6 +1192,7 @@ func (u *TokenUsage) Add(other TokenUsage) {
 	u.CacheReadTokens += other.CacheReadTokens
 	u.CacheCreationTokens += other.CacheCreationTokens
 	u.ReasoningTokens += other.ReasoningTokens
+	u.ReasoningReported = u.ReasoningReported || other.ReasoningReported
 	u.Reported = u.Reported || other.Reported
 	u.CacheCreationReported = u.CacheCreationReported || other.CacheCreationReported
 }
@@ -821,32 +1201,58 @@ func (u *TokenUsage) Add(other TokenUsage) {
 // For native agents, extraArgs are user CLI flags from agent_args_override that
 // are injected into the underlying tool's argv ahead of no-mistakes' managed flags.
 // ACP agents and aliases ignore extraArgs; use NewWithOptions to provide
-// registry overrides.
+// registry overrides and the harness-neutral model/effort Profile.
 func New(name types.AgentName, bin string, extraArgs []string) (Agent, error) {
 	return NewWithOptions(name, bin, extraArgs, Options{})
 }
 
 // NewWithOptions creates an agent by name with additional backend-specific options.
 func NewWithOptions(name types.AgentName, bin string, extraArgs []string, opts Options) (Agent, error) {
+	// Fail closed on a knob this harness cannot express. Config load performs
+	// the same check, but this is the funnel every caller reaches - including
+	// eval replay and programmatic callers that build a profile directly - so a
+	// run can never report a model or effort it did not actually use.
+	if err := agentcfg.Validate(name, opts.Profile); err != nil {
+		return nil, err
+	}
 	if target, ok := types.ACPTargetFor(name); ok {
 		rawCommand := types.ACPRawCommand(target, opts.ACPRegistryOverrides)
-		return &acpxAgent{bin: bin, target: target, rawCommand: rawCommand}, nil
+		return &acpxAgent{bin: bin, target: target, rawCommand: rawCommand, model: opts.Profile.Model, subprocessContext: newSubprocessContext(opts.Environment)}, nil
+	}
+	// Mapped flags follow the operator's raw agent_args_override flags, so they
+	// still precede no-mistakes' managed flags in every adapter's argv. A knob
+	// the raw args already pin natively is not emitted at all (see agentcfg),
+	// which is what keeps pre-existing configurations byte-identical.
+	if mapped := agentcfg.NativeArgs(name, opts.Profile, extraArgs); len(mapped) > 0 {
+		merged := make([]string, 0, len(extraArgs)+len(mapped))
+		merged = append(merged, extraArgs...)
+		merged = append(merged, mapped...)
+		extraArgs = merged
 	}
 	switch name {
 	case types.AgentClaude:
-		return &claudeAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings}, nil
+		return &claudeAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings, subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	case types.AgentCodex:
-		return &codexAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings}, nil
+		return &codexAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings, subprocessContext: newSubprocessContext(opts.Environment)}, nil
+	case types.AgentGrok:
+		return &grokAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings, subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	case types.AgentRovoDev:
-		return &rovodevAgent{bin: bin, extraArgs: extraArgs}, nil
+		return &rovodevAgent{bin: bin, extraArgs: extraArgs, subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	case types.AgentOpenCode:
-		return &opencodeAgent{bin: bin, extraArgs: extraArgs}, nil
+		return &opencodeAgent{bin: bin, extraArgs: extraArgs, profile: opts.Profile, subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	case types.AgentPi:
-		return &piAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings}, nil
+		return &piAgent{
+			bin:                    bin,
+			extraArgs:              extraArgs,
+			disableProjectSettings: opts.DisableProjectSettings,
+			subprocessContext:      newSubprocessContext(opts.Environment),
+		}, nil
 	case types.AgentCopilot:
-		return &copilotAgent{bin: bin, extraArgs: extraArgs}, nil
+		return &copilotAgent{bin: bin, extraArgs: extraArgs, subprocessContext: newSubprocessContext(opts.Environment)}, nil
+	case types.AgentAntigravity:
+		return &antigravityAgent{bin: bin, extraArgs: extraArgs, subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	default:
-		return nil, fmt.Errorf("unknown agent %q; valid options: auto, claude, codex, rovodev, opencode, pi, copilot, cursor, acp:<target> (set 'agent' in ~/.no-mistakes/config.yaml)", name)
+		return nil, fmt.Errorf("unknown agent %q; valid options: auto, claude, codex, grok, rovodev, opencode, pi, copilot, cursor, antigravity, acp:<target> (set 'agent' in ~/.no-mistakes/config.yaml)", name)
 	}
 }
 

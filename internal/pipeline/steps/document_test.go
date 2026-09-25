@@ -3,13 +3,17 @@ package steps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -42,6 +46,9 @@ func TestDocumentStep_AgentManaged_FixesAndCommitsWithoutApproval(t *testing.T) 
 	}
 	if outcome.AutoFixable {
 		t.Error("expected no auto-fix loop in agent-managed document mode")
+	}
+	if outcome.FixSummary != changesAppliedSummary {
+		t.Fatalf("fix summary = %q, want %q", outcome.FixSummary, changesAppliedSummary)
 	}
 	if status := gitStatusPorcelain(t, dir); status != "" {
 		t.Fatalf("expected clean worktree after doc commit, got %q", status)
@@ -130,6 +137,9 @@ func TestDocumentStep_AgentManaged_UnresolvedFindingsNeedApprovalWithoutAutoFixL
 	}
 	if outcome.AutoFixable {
 		t.Error("expected unresolved documentation findings not to trigger an auto-fix round")
+	}
+	if outcome.FixSummary != noChangesAppliedSummary {
+		t.Fatalf("fix summary = %q, want %q", outcome.FixSummary, noChangesAppliedSummary)
 	}
 	var findings Findings
 	if err := json.Unmarshal([]byte(outcome.Findings), &findings); err != nil {
@@ -307,7 +317,7 @@ func TestDocumentStep_NoChanges_SkipsAgent(t *testing.T) {
 	}
 }
 
-func TestDocumentStep_MalformedOutput_CommitsAndRequiresApproval(t *testing.T) {
+func TestDocumentStep_MalformedOutput_CommitsAndFailsClosed(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	gitCmd(t, dir, "checkout", "--detach", headSHA)
@@ -326,24 +336,11 @@ func TestDocumentStep_MalformedOutput_CommitsAndRequiresApproval(t *testing.T) {
 
 	step := &DocumentStep{}
 	outcome, err := step.Execute(sctx)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), "validate document analyzer findings") {
+		t.Fatalf("Execute() error = %v, want malformed document analyzer output", err)
 	}
-	if !outcome.NeedsApproval {
-		t.Fatal("expected malformed output to require approval")
-	}
-	if outcome.AutoFixable {
-		t.Fatal("expected malformed output not to trigger an auto-fix loop")
-	}
-	var findings Findings
-	if err := json.Unmarshal([]byte(outcome.Findings), &findings); err != nil {
-		t.Fatalf("unmarshal findings: %v", err)
-	}
-	if len(findings.Items) != 1 {
-		t.Fatalf("expected 1 finding, got %+v", findings.Items)
-	}
-	if findings.Items[0].Action != types.ActionAskUser {
-		t.Error("expected malformed output finding to require human review")
+	if outcome != nil {
+		t.Fatalf("Execute() outcome = %+v, want no outcome", outcome)
 	}
 	// Any edits the agent made should still be committed.
 	if status := gitStatusPorcelain(t, dir); status != "" {
@@ -351,7 +348,7 @@ func TestDocumentStep_MalformedOutput_CommitsAndRequiresApproval(t *testing.T) {
 	}
 }
 
-func TestDocumentStep_NoStructuredOutput_RequiresApproval(t *testing.T) {
+func TestDocumentStep_NoStructuredOutput_FailsClosed(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 
@@ -365,20 +362,176 @@ func TestDocumentStep_NoStructuredOutput_RequiresApproval(t *testing.T) {
 
 	step := &DocumentStep{}
 	outcome, err := step.Execute(sctx)
+	if err == nil || !strings.Contains(err.Error(), "document analyzer returned no structured findings") {
+		t.Fatalf("Execute() error = %v, want missing document analyzer output", err)
+	}
+	if outcome != nil {
+		t.Fatalf("Execute() outcome = %+v, want no outcome", outcome)
+	}
+}
+
+func TestDocumentStep_HangingAgentFailsRunAfterTimeout(t *testing.T) {
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	ag := &mockAgent{
+		name: "hanging-document-agent",
+		runFn: func(ctx context.Context, _ agent.RunOpts) (*agent.Result, error) {
+			<-ctx.Done()
+			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"update docs"}`)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Config.AgentTimeout = 20 * time.Millisecond
+
+	exec := pipeline.NewExecutor(sctx.DB, paths.WithRoot(t.TempDir()), sctx.Config, ag, []pipeline.Step{&DocumentStep{}}, nil)
+	if err := exec.Execute(context.Background(), sctx.Run, sctx.Repo, dir); err == nil {
+		t.Fatal("expected hanging document agent to fail the run")
+	}
+
+	run, err := sctx.DB.GetRun(sctx.Run.ID)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("get run: %v", err)
 	}
-	if !outcome.NeedsApproval {
-		t.Fatal("expected missing structured output to require approval")
+	if run.Status != types.RunFailed {
+		t.Fatalf("run status = %s, want %s", run.Status, types.RunFailed)
 	}
-	if outcome.AutoFixable {
-		t.Fatal("expected missing structured output not to trigger an auto-fix loop")
+	if run.Error == nil || !strings.Contains(*run.Error, "agent timed out after 20ms") {
+		var got string
+		if run.Error != nil {
+			got = *run.Error
+		}
+		t.Fatalf("run error = %q, want timeout diagnostic", got)
 	}
-	var findings Findings
-	if err := json.Unmarshal([]byte(outcome.Findings), &findings); err != nil {
-		t.Fatalf("unmarshal findings: %v", err)
+}
+
+func TestDocumentStep_SuccessfulReturnAfterTimeoutFailsWithoutCommit(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	gitCmd(t, dir, "checkout", "--detach", headSHA)
+	ag := &mockAgent{
+		name: "late-document-agent",
+		runFn: func(ctx context.Context, _ agent.RunOpts) (*agent.Result, error) {
+			if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# late\n"), 0o644); err != nil {
+				return nil, err
+			}
+			<-ctx.Done()
+			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"update README"}`)}, nil
+		},
 	}
-	if len(findings.Items) != 1 || findings.Items[0].Action != types.ActionAskUser {
-		t.Fatalf("expected 1 ask-user finding, got %+v", findings.Items)
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Config.AgentTimeout = 20 * time.Millisecond
+
+	if _, err := (&DocumentStep{}).Execute(sctx); err == nil || !strings.Contains(err.Error(), "timed out after 20ms") {
+		t.Fatalf("late successful return error = %v, want timeout", err)
+	}
+	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got != headSHA {
+		t.Fatalf("HEAD = %s, want unchanged %s", got, headSHA)
+	}
+}
+
+// TestDocumentStep_SchemaRejectionRerunsAndTakesTheValidAnswer is the
+// document half of the analyzer-retry contract the Review and Test steps
+// already carry: an answer whose final JSON fails validation is a formatting
+// slip, so the pass is rerun session-free against the same prompt plus the
+// validation error, and findings come only from the attempt that validates.
+func TestDocumentStep_SchemaRejectionRerunsAndTakesTheValidAnswer(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	gitCmd(t, dir, "checkout", "--detach", headSHA)
+
+	const validation = `pi output parse: JSON output must be object (received array)`
+	calls := 0
+	ag := &mockAgent{
+		name: "pi",
+		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+			calls++
+			if calls == 1 {
+				return nil, rejectedStructuredOutputError{message: validation}
+			}
+			if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# Updated\n"), 0o644); err != nil {
+				return nil, err
+			}
+			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"update README"}`)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	var logs []string
+	sctx.Log = func(s string) { logs = append(logs, s) }
+
+	outcome, err := (&DocumentStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatalf("a schema slip must rerun the document pass, not fail the step: %v", err)
+	}
+	if len(ag.calls) != 2 {
+		t.Fatalf("agent calls = %d, want the rejected pass plus one rerun", len(ag.calls))
+	}
+	if _, ok := strings.CutPrefix(ag.calls[1].Prompt, ag.calls[0].Prompt); !ok {
+		t.Fatalf("rerun prompt is not the original prompt plus a retry note:\n%s", ag.calls[1].Prompt)
+	}
+	if !strings.Contains(ag.calls[1].Prompt, validation) {
+		t.Fatalf("rerun prompt does not quote the validation error:\n%s", ag.calls[1].Prompt)
+	}
+	if outcome == nil || outcome.NeedsApproval {
+		t.Fatalf("outcome = %+v, want a clean documented outcome", outcome)
+	}
+	if got := lastCommitMessage(t, dir); !strings.Contains(got, "update README") {
+		t.Fatalf("last commit message = %q, want the validated summary", got)
+	}
+	if len(logs) == 0 || !strings.Contains(strings.Join(logs, "\n"), "rerunning") {
+		t.Fatalf("retry was not logged: %v", logs)
+	}
+}
+
+// TestDocumentStep_SchemaRejectionExhaustsAttemptsAndFailsClosed proves the
+// retry is bounded and that an unreadable answer still never passes.
+func TestDocumentStep_SchemaRejectionExhaustsAttemptsAndFailsClosed(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	gitCmd(t, dir, "checkout", "--detach", headSHA)
+
+	const validation = `pi output parse: JSON output must be object (received array)`
+	calls := 0
+	ag := &mockAgent{
+		name: "pi",
+		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+			calls++
+			return nil, rejectedStructuredOutputError{message: validation}
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+
+	outcome, err := (&DocumentStep{}).Execute(sctx)
+	if err == nil || !strings.Contains(err.Error(), validation) {
+		t.Fatalf("Execute() error = %v, want the analyzer validation error", err)
+	}
+	if outcome != nil {
+		t.Fatalf("Execute() outcome = %+v, want no outcome", outcome)
+	}
+	if calls != documentAnalyzerMaxAttempts {
+		t.Fatalf("agent calls = %d, want %d", calls, documentAnalyzerMaxAttempts)
+	}
+}
+
+// TestDocumentStep_NonRejectionAgentErrorIsNotRetried keeps the retry scoped
+// to correctable schema slips: a hard agent failure returns at once.
+func TestDocumentStep_NonRejectionAgentErrorIsNotRetried(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	gitCmd(t, dir, "checkout", "--detach", headSHA)
+
+	calls := 0
+	ag := &mockAgent{
+		name: "pi",
+		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+			calls++
+			return nil, errors.New("pi exited: signal: killed")
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+
+	if _, err := (&DocumentStep{}).Execute(sctx); err == nil || !strings.Contains(err.Error(), "pi exited") {
+		t.Fatalf("Execute() error = %v, want the agent failure", err)
+	}
+	if calls != 1 {
+		t.Fatalf("agent calls = %d, want a hard agent failure to return at once", calls)
 	}
 }
