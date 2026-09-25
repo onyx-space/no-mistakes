@@ -215,9 +215,10 @@ daemon_restart() {
 # the daemon's own start time at whole-second resolution (ps -o lstart=), so
 # both sides are compared floored to the second: a start in the same second as
 # the install is not read as stale.
-# Exit codes: 0 fresh, 1 stale, 2 unverifiable.
+# Exit codes: 0 fresh, 1 stale, 2 unverifiable, 3 no daemon running.
 daemon_fresh() {
 	local pidfile="$1" bin="$2" verdict
+	[ -e "$pidfile" ] || return 3
 	command -v python3 >/dev/null 2>&1 || return 2
 	verdict="$(python3 - "$pidfile" "$bin" <<'PY'
 import json, math, os, sys
@@ -225,6 +226,13 @@ from datetime import datetime
 try:
     with open(sys.argv[1]) as fh:
         started = json.load(fh).get("started_at")
+except OSError:
+    print("no-daemon")
+    raise SystemExit
+except Exception:
+    print("unknown")
+    raise SystemExit
+try:
     if not started:
         raise ValueError("no started_at")
     started_at = datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
@@ -238,6 +246,7 @@ PY
 	case "$verdict" in
 	fresh) return 0 ;;
 	stale) return 1 ;;
+	no-daemon) return 3 ;;
 	*) return 2 ;;
 	esac
 }
@@ -251,16 +260,22 @@ old_version="$("$BIN" --version | awk '{print $3}')"
 if [ "$old_version" = "$built_version" ]; then
 	fresh_rc=0
 	daemon_fresh "${NM_HOME:-$HOME/.no-mistakes}/daemon.pid" "$BIN" || fresh_rc=$?
-	if [ "$fresh_rc" = 1 ]; then
+	case "$fresh_rc" in
+	1)
 		log "$BIN already is this build ($built_version), but the running daemon predates it; restarting"
-	else
+		;;
+	3)
+		log "$BIN already is this build ($built_version), but no daemon is running; starting it"
+		;;
+	*)
 		if [ "$fresh_rc" = 2 ]; then
 			log "note: could not verify the running daemon is this build; leaving it alone"
 		fi
 		log "$BIN already is this build ($built_version); leaving it and the daemon alone"
 		log "done"
 		exit 0
-	fi
+		;;
+	esac
 fi
 
 # ---------------------------------------------------------------------------
@@ -343,7 +358,7 @@ fresh_rc=0
 daemon_fresh "${NM_HOME:-$HOME/.no-mistakes}/daemon.pid" "$BIN" || fresh_rc=$?
 if [ "$fresh_rc" = 1 ]; then
 	die "the running daemon predates the installed binary (the previous binary is restored)"
-elif [ "$fresh_rc" = 2 ]; then
+elif [ "$fresh_rc" != 0 ]; then
 	log "note: could not verify the running daemon is this build; continuing"
 fi
 

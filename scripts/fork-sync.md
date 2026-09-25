@@ -39,7 +39,7 @@ install -m644 ~/code/no-mistakes/scripts/fork-sync.md \
   脚本在替换二进制**之前**读 `~/.no-mistakes/state.sqlite` 的 `runs` 表，有未终态 run
   就拒绝并列出，除非显式 `--force`（`--force` 同时透传给 `daemon restart`）。替换成功后用
   `no-mistakes daemon restart` 让 daemon 吃上新构建；daemon 判据 = `daemon.pid` 记录的
-  进程启动时间（秒级）不早于二进制 mtime，读不到就告警继续。
+  进程启动时间（秒级）不早于二进制 mtime；探测本身不可用（比如缺 python3）就告警继续。
 
 ## 用法
 
@@ -81,7 +81,8 @@ install -m644 ~/code/no-mistakes/scripts/fork-sync.md \
 幂等：对已同步的 fork 再跑一次，merge 无事可做、build 出**同版本戳**的产物（`make build` 会把
 构建时间嵌进去，所以字节不同、版本相同）；已装二进制就是该版本戳、且运行中的 daemon 也在跑
 这份构建时，install 与 daemon 重启都跳过。若 daemon 早于该二进制（比如上次换完二进制但没重启
-成功），脚本仍会走 install/restart，不会让 CLI 与 daemon 停在两个构建上。判据是
+成功），或 daemon 没在跑（`daemon.pid` 不在，比如机器重启后没起来），脚本仍会走 install/restart，
+不会让 CLI 与 daemon 停在两个构建上、也不会留下一个没起来的运行时。判据是
 `no-mistakes --version` 的版本戳（= 该分支的 `git describe`），不是字节。
 
 ## 常见坑
